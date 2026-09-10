@@ -1,5 +1,6 @@
 import tgpu, { d, type TgpuRoot } from 'typegpu';
 import { DRAW_TOURNAMENT, MAX_DRAWS } from '../draw';
+import { FRESH_START_EVERY } from '../engine';
 import {
     BOARD_CELLS, BOARD_H, BOARD_W, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, PLACE_LEFT_COL, PLACE_TOP_ROW, PLACE_TOUCHES_EDGE, PLACE_VALID, SCAN_STRIDES,
     SHAPE_COUNT
@@ -701,10 +702,16 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         for (let i = 0; i < BOARD_CELLS; i++) state.$[t].best[i] = s.cur.$[i];
     };
 
-    const restart = () => {
+    // Back to the record board, and every FRESH_START_EVERY-th time to the initial board, as in ../engine.ts
+    const restart = (t: number) => {
         'use gpu';
         s.hasEpoch.$ = 0;
-        for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[i] = aux.$[params.$.initialBoardOffset + i];
+        s.restarts.$ = s.restarts.$ + 1;
+        if (s.restarts.$ % FRESH_START_EVERY === 0) {
+            for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[i] = aux.$[params.$.initialBoardOffset + i];
+        } else {
+            for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[i] = state.$[t].best[i];
+        }
         s.curPieces.$ = -1;
     };
 
@@ -741,15 +748,15 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         let ordering = 1;
         if (s.hasEpoch.$ !== 0) ordering = compareCurToEpoch();
         const improved = ordering > 0;
-        if (improved || (ordering === 0 && rngCoinFlip())) {
-            if (improved) {
+        if (isStagnant || improved || (ordering === 0 && rngCoinFlip())) {
+            if (isStagnant || improved) {
                 for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.epochTiers.$[i] = s.curTiers.$[i];
                 s.hasEpoch.$ = 1;
             }
             acceptTest();
-            if (improved && (s.hasRecord.$ === 0 || curBeatsBest())) {
-                recordBest(t);
+            if (improved) {
                 s.stagnation.$ = 0;
+                if (s.hasRecord.$ === 0 || curBeatsBest()) recordBest(t);
             } else {
                 s.stagnation.$ = s.stagnation.$ + 1;
             }
@@ -762,7 +769,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
             s.stagnations.$ = s.stagnations.$ + 1;
             if (s.stagnations.$ >= params.$.restartAfter) {
                 s.stagnations.$ = 0;
-                restart();
+                restart(t);
             }
         }
     };
@@ -773,6 +780,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         rngInc.$ = state.$[t].rngInc;
         s.stagnation.$ = state.$[t].stagnation;
         s.stagnations.$ = state.$[t].stagnations;
+        s.restarts.$ = state.$[t].restarts;
         s.hasEpoch.$ = state.$[t].hasEpoch;
         s.hasRecord.$ = state.$[t].hasRecord;
         s.curP.$ = state.$[t].curP; s.curQ.$ = state.$[t].curQ; s.curE.$ = state.$[t].curE; s.curPieces.$ = state.$[t].curPieces;
@@ -789,6 +797,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         state.$[t].rngInc = rngInc.$;
         state.$[t].stagnation = s.stagnation.$;
         state.$[t].stagnations = s.stagnations.$;
+        state.$[t].restarts = s.restarts.$;
         state.$[t].hasEpoch = s.hasEpoch.$;
         state.$[t].hasRecord = s.hasRecord.$;
         state.$[t].curP = s.curP.$; state.$[t].curQ = s.curQ.$; state.$[t].curE = s.curE.$; state.$[t].curPieces = s.curPieces.$;
@@ -826,7 +835,48 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         champion.$[i] = state.$[params.$.championIdx].best[i];
     });
 
-    return { tables, params, state, scores, champion, searchStep, extractChampion, runThread };
+    const migrateBelow = (i: number) => {
+        'use gpu';
+        let v = params.$.migrateBelow0;
+        if (i === 1) v = params.$.migrateBelow1;
+        if (i === 2) v = params.$.migrateBelow2;
+        if (i === 3) v = params.$.migrateBelow3;
+        return v;
+    };
+
+    const recordBelowThreshold = (t: number) => {
+        'use gpu';
+        if (state.$[t].hasRecord === 0) return true;
+        for (let i = 0; i < params.$.tierCount; i++) {
+            const v = state.$[t].bestTiers[i];
+            if (v !== migrateBelow(i)) return v < migrateBelow(i);
+        }
+        return false;
+    };
+
+    /* Threads whose record falls below the threshold take the champion as their record and their current board, and climb from it as a restart would
+     * Their own perturbations of the champion are what the population gains; the threads above the threshold keep their own regions
+     */
+    const migrate = tgpu.computeFn({ workgroupSize: [WORKGROUP_SIZE], in: { gid: d.builtin.globalInvocationId } })((input) => {
+        'use gpu';
+        const t = d.i32(input.gid.x);
+        if (t >= params.$.threadCount) return;
+        const c = params.$.championIdx;
+        if (t === c || !recordBelowThreshold(t)) return;
+        for (let i = 0; i < BOARD_CELLS; i++) {
+            const cell = state.$[c].best[i];
+            state.$[t].cur[i] = cell;
+            state.$[t].best[i] = cell;
+        }
+        for (let i = 0; i < TIER_VECTOR_LENGTH; i++) state.$[t].bestTiers[i] = state.$[c].bestTiers[i];
+        state.$[t].hasRecord = 1;
+        state.$[t].hasEpoch = 0;
+        state.$[t].curPieces = -1;
+        state.$[t].stagnation = 0;
+        state.$[t].stagnations = 0;
+    });
+
+    return { tables, params, state, scores, champion, searchStep, extractChampion, migrate, runThread };
 };
 
 export type SearchKernel = ReturnType<typeof createSearchKernel>;

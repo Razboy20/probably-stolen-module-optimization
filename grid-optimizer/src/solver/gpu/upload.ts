@@ -90,7 +90,8 @@ export const buildGpuTables = (setup: SolveSetup): GpuTables => {
         drawRankOffset: offsets[3],
         initialBoardOffset: offsets[3 + drawRanks.length],
         statOffset: offsets[4 + drawRanks.length],
-        championIdx: 0
+        championIdx: 0,
+        migrateBelow0: 0, migrateBelow1: 0, migrateBelow2: 0, migrateBelow3: 0
     };
     return { pool: buildPool(setup), geometry: buildGeometry(), aux, params };
 };
@@ -101,7 +102,7 @@ export const buildInitialStates = (setup: SolveSetup, seed: number, threads: num
         const rng = seedRng(seed, thread);
         return {
             rngCtr: rng[RNG_CTR], rngInc: rng[RNG_INC],
-            stagnation: 0, stagnations: 0, hasEpoch: 0, hasRecord: 0,
+            stagnation: 0, stagnations: 0, restarts: 0, hasEpoch: 0, hasRecord: 0,
             curP: 0, curQ: 0, curE: 0, curPieces: -1,
             epochTiers: [0, 0, 0, 0], bestTiers: [0, 0, 0, 0],
             cur: Array.from(setup.initialIndexBoard), best: Array.from(setup.initialIndexBoard)

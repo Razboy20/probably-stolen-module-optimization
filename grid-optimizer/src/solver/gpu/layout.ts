@@ -42,6 +42,7 @@ export const ThreadState = d.struct({
     rngInc: d.u32,
     stagnation: d.i32,
     stagnations: d.i32,
+    restarts: d.i32,
     hasEpoch: d.i32,
     hasRecord: d.i32,
     curP: d.i32, curQ: d.i32, curE: d.i32, curPieces: d.i32,
@@ -76,7 +77,9 @@ export const Params = d.struct({
     drawRankOffset: d.i32,
     initialBoardOffset: d.i32,
     statOffset: d.i32,
-    championIdx: d.i32
+    championIdx: d.i32,
+    // A thread whose record is below these tiers adopts the champion when the migration pass runs
+    migrateBelow0: d.i32, migrateBelow1: d.i32, migrateBelow2: d.i32, migrateBelow3: d.i32
 });
 
 export type ParamsValue = d.Infer<typeof Params>;

@@ -18,7 +18,7 @@ export const curTiers = i32s(TIER_VECTOR_LENGTH);
 export const epochTiers = i32s(TIER_VECTOR_LENGTH);
 export const bestTiers = i32s(TIER_VECTOR_LENGTH);
 export const hasEpoch = i32v(), hasRecord = i32v();
-export const stagnation = i32v(), stagnations = i32v();
+export const stagnation = i32v(), stagnations = i32v(), restarts = i32v();
 
 // Items on the board this iteration, so the draw skips them
 export const blocked = tgpu.privateVar(d.arrayOf(d.u32, BLOCKED_WORDS), d.arrayOf(d.u32, BLOCKED_WORDS)());

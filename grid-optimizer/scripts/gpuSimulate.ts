@@ -14,7 +14,7 @@ import { buildBenchCase } from './benchCase';
 const SEED = Number(process.env.SEED ?? 1);
 const N = Number(process.env.N ?? 200);
 const ITERS = Number(process.env.ITERS ?? 300);
-const TARGETS = process.env.TARGETS === '1';
+const TARGETS = Number(process.env.TARGETS ?? 0);
 const THREAD = Number(process.env.THREAD ?? 0);
 
 (globalThis as Record<string, unknown>).GPUBufferUsage = { COPY_DST: 8, COPY_SRC: 4, STORAGE: 128, UNIFORM: 64, MAP_READ: 1 };
@@ -25,7 +25,7 @@ const setup = prepareSolve({ machine, initialBoard: board, searchPoolInventory: 
 if (!fitsGpu(setup)) throw new Error('case does not fit the GPU tables');
 
 const kernel = createSearchKernel(root, setup, SEED, THREAD + 1, ITERS);
-const wgsl = tgpu.resolve([kernel.searchStep, kernel.extractChampion], { names: 'strict' });
+const wgsl = tgpu.resolve([kernel.searchStep, kernel.extractChampion, kernel.migrate], { names: 'strict' });
 if (process.env.WGSL_OUT) await Bun.write(process.env.WGSL_OUT, wgsl);
 
 const t0 = performance.now();

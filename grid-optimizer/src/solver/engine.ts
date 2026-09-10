@@ -18,8 +18,10 @@ import { createYielder, FRAME_BUDGET_MS, now, TIMER_YIELD_INTERVAL_MS } from './
 // existed at commit e5c614c. The UI only ever ran one machine per engine, so it was removed
 // Run All is N independent single-machine solves
 
-// How many stagnations in a row the search rides out on the same board before it gives up on it and starts over from the initial board
+// How many perturbations in a row the search rides out without a new record before it goes back to the record board
 export const RESTART_AFTER_STAGNATIONS = 8;
+// Every so many restarts the search starts over from the initial board instead, so it does not spend all its time around one record
+export const FRESH_START_EVERY = 4;
 
 export const STAGNATION_LIMIT = 150;
 
@@ -83,6 +85,7 @@ export const runOptimizationEngine = async (
 
     let stagnationCounter = 0;
     let stagnationRuns = 0;
+    let restarts = 0;
 
     // Scratch, cleared per iteration rather than reallocated
     // blocked: items sitting on the board this iteration, so the draw skips them
@@ -380,25 +383,32 @@ export const runOptimizationEngine = async (
 
             if (!control.running) break;
 
-            // Judged against the best of THIS attempt, not the best ever
-            // After a restart the board is deliberately worse than the record, and comparing it to the record would reject every move and leave the restart unable to climb at all
+            /* Judged against the best of THIS attempt, not the best ever
+             * After a restart the board is deliberately worse than the record, and comparing it to the record would reject every move and leave the restart unable to climb at all
+             *
+             * The big ruin of a stagnant board is a perturbation, not a move, and is kept whatever it scores: judged like a move it would almost never survive on a board that
+             * has been climbed for hundreds of iterations, and the search would only ever leave a local optimum by starting over. Keeping it lets the climb resume from a
+             * board that still has most of a good packing, which is a different place to look than a fresh greedy build. The record is banked in bestBoard either way
+             */
             const ordering = hasEpoch ? compareTiers(currentTiers, epochTiers, tierLength) : 1;
             const improved = ordering > 0;
-            if (improved || (ordering === 0 && rngCoinFlip(rng))) {
-                if (improved) {
+            if (isStagnant || improved || (ordering === 0 && rngCoinFlip(rng))) {
+                if (isStagnant || improved) {
                     epochTiers.set(currentTiers);
                     hasEpoch = true;
                 }
                 currentBoard.set(testBoard);
                 copyTotals(fillTotals, currentTotals);
 
-                // A new record is the only thing worth reporting, and the only thing that resets the stagnation count
-                if (improved && (!hasRecord || compareTiers(currentTiers, bestTiers, tierLength) > 0)) {
-                    bestTiers.set(currentTiers);
-                    hasRecord = true;
-                    bestBoard.set(currentBoard);
-                    pendingUpdate = true;
+                // Any step up from the epoch's best is progress worth riding out; a new record is additionally the only thing worth reporting
+                if (improved) {
                     stagnationCounter = 0;
+                    if (!hasRecord || compareTiers(currentTiers, bestTiers, tierLength) > 0) {
+                        bestTiers.set(currentTiers);
+                        hasRecord = true;
+                        bestBoard.set(currentBoard);
+                        pendingUpdate = true;
+                    }
                 } else {
                     stagnationCounter++;
                 }
@@ -408,14 +418,12 @@ export const runOptimizationEngine = async (
 
             if (isStagnant) {
                 stagnationCounter = 0;
-                // A big ruin is still judged against the epoch's best, so it only ever gets kept if it comes out ahead
-                // On a board that has been hill-climbed for thousands of iterations it almost never does
-                // Past a point it is very likely that this attempt is finished, and the iterations are better spent on a fresh one than on shaking the same board forever
-                // The record is already banked in bestBoard, so a restart can only cost time, never a result
+                // Perturbing the same neighbourhood for long without a new record means the record is probably as good as this region gets
+                // The next perturbations go back to the record itself, and now and then to the initial board so the search also sees other regions
                 if (++stagnationRuns >= RESTART_AFTER_STAGNATIONS) {
                     stagnationRuns = 0;
                     hasEpoch = false;
-                    currentBoard.set(initialIndexBoard);
+                    currentBoard.set(++restarts % FRESH_START_EVERY === 0 ? initialIndexBoard : bestBoard);
                     boardTotals(tables, currentBoard, currentTotals);
                 }
             }

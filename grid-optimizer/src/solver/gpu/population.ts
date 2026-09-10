@@ -12,6 +12,9 @@ import { fitsGpu } from './upload';
 const TARGET_DISPATCH_MS = 30;
 const MAX_ITERS_PER_DISPATCH = 512;
 const SLOW_DISPATCH_MS = 250;
+// Every so many dispatches the threads in the worst quarter by record adopt the champion
+const MIGRATE_EVERY = 16;
+const MIGRATE_FRACTION = 4;
 
 let rootPromise: Promise<TgpuRoot> | null = null;
 const acquireRoot = () => {
@@ -46,6 +49,15 @@ const tiersBeat = (scores: number[], a: number, b: number, tierLength: number) =
     return false;
 };
 
+// The record tiers a thread must be below to be in the worst MIGRATE_FRACTION-th of the threads that have a record
+const migrationThreshold = (scores: number[], threads: number, tierLength: number) => {
+    const ranked: number[] = [];
+    for (let t = 0; t < threads; t++) if (scores[t * TIER_VECTOR_LENGTH] !== NO_RECORD) ranked.push(t);
+    ranked.sort((a, b) => tiersBeat(scores, a * TIER_VECTOR_LENGTH, b * TIER_VECTOR_LENGTH, tierLength) ? 1 : tiersBeat(scores, b * TIER_VECTOR_LENGTH, a * TIER_VECTOR_LENGTH, tierLength) ? -1 : 0);
+    const at = ranked[Math.trunc(ranked.length / MIGRATE_FRACTION)] * TIER_VECTOR_LENGTH;
+    return scores.slice(at, at + TIER_VECTOR_LENGTH);
+};
+
 const validated = async <T>(device: GPUDevice, work: () => Promise<T>) => {
     device.pushErrorScope('validation');
     const result = await work();
@@ -71,6 +83,7 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
 
         const search = root.createComputePipeline({ compute: kernel.searchStep });
         const extract = root.createComputePipeline({ compute: kernel.extractChampion });
+        const migrate = root.createComputePipeline({ compute: kernel.migrate });
         const workgroups = Math.ceil(threads / WORKGROUP_SIZE);
 
         let lost = false;
@@ -84,6 +97,7 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
 
         let bestTiers: Int32Array | null = null;
         let iterations = 0;
+        let dispatches = 0;
         let first = true;
         while (running && iterations < maxIterations) {
             const t0 = performance.now();
@@ -100,11 +114,19 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
             const scores = await kernel.scores.read();
             const winner = bestThread(scores, threads, setup.tierLength);
             if (winner === -1) continue;
+            params.championIdx = winner;
+
+            if (++dispatches % MIGRATE_EVERY === 0) {
+                const [b0, b1, b2, b3] = migrationThreshold(scores, threads, setup.tierLength);
+                Object.assign(params, { migrateBelow0: b0, migrateBelow1: b1, migrateBelow2: b2, migrateBelow3: b3 });
+                kernel.params.write(params);
+                migrate.dispatchWorkgroups(workgroups);
+            }
+
             const tiers = Int32Array.from(scores.slice(winner * TIER_VECTOR_LENGTH, (winner + 1) * TIER_VECTOR_LENGTH));
             if (bestTiers !== null && compareTiers(tiers, bestTiers, setup.tierLength) <= 0) continue;
             bestTiers = tiers;
 
-            params.championIdx = winner;
             kernel.params.write(params);
             extract.dispatchWorkgroups(1);
             const board = Int32Array.from(await kernel.champion.read());

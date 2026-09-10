@@ -8,7 +8,7 @@ const query = new URLSearchParams(location.search);
 const SEED = Number(query.get('seed') ?? 1);
 const N = Number(query.get('n') ?? 200);
 const MS = Number(query.get('ms') ?? 3000);
-const TARGETS = query.get('targets') === '1';
+const TARGETS = Number(query.get('targets') ?? 0);
 const IMPL = (query.get('impl') ?? 'gpu') as SolverBackend;
 const PARALLELISM = query.get('threads') ? Number(query.get('threads')) : undefined;
 

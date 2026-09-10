@@ -8,7 +8,7 @@ const SEED = Number(process.env.SEED ?? 1);
 const N = Number(process.env.N ?? 200);
 const MS = Number(process.env.MS ?? 3000);
 const ITERS = Number(process.env.ITERS ?? 0);
-const TARGETS = process.env.TARGETS === '1';
+const TARGETS = Number(process.env.TARGETS ?? 0);
 const IMPL = (process.env.IMPL ?? 'inline') as SolverBackend;
 const WORKERS = process.env.WORKERS ? Number(process.env.WORKERS) : undefined;
 

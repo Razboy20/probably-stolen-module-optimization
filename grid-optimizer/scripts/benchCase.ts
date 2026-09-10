@@ -3,8 +3,13 @@ import type { MachineConfig } from '../src/solver/objective';
 import { EFFECTS_LIST, MODULE_TEMPLATES } from '../src/constants';
 import type { InventoryItem, ItemEffect } from '../src/types';
 
-// A seeded synthetic inventory and machine, the same for every backend and runtime the benchmarks compare
-export const buildBenchCase = (seedValue: number, n: number, targets: boolean) => {
+/* A seeded synthetic inventory and machine, the same for every backend and runtime the benchmarks compare
+ * Case 0 maximizes everything; case 1 holds Performance and Quality to targets the pool meets easily and maximizes the rest;
+ * case 2 asks for a Performance near the most the pool can reach (661–753 across seeds 1–4), so the shortfall shapes the whole search
+ */
+export const BENCH_CASES = 3;
+
+export const buildBenchCase = (seedValue: number, n: number, benchCase: number) => {
     let seed = seedValue * 7919 + 12345;
     const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
     Math.random = rnd;
@@ -19,7 +24,11 @@ export const buildBenchCase = (seedValue: number, n: number, targets: boolean) =
     inv.push(node);
     for (let i = 0; i < 17; i++) inv.push({ ...node, id: `node_clone_${i}` });
 
-    const machine: MachineConfig = targets ? {
+    const machine: MachineConfig = benchCase === 0 ? {
+        id: 'mach0', tier: 3,
+        targetStats: { Performance: null, Quality: null, Efficiency: null },
+        maximizeStats: { Performance: true, Quality: true, Efficiency: true },
+    } : benchCase === 1 ? {
         id: 'mach0', tier: 3,
         targetStats: { Performance: 200, Quality: 80, Efficiency: null },
         maximizeStats: { Performance: false, Quality: true, Efficiency: true },
@@ -27,12 +36,14 @@ export const buildBenchCase = (seedValue: number, n: number, targets: boolean) =
         statPriority: { Performance: 1, Quality: 2, Efficiency: 3 },
     } : {
         id: 'mach0', tier: 3,
-        targetStats: { Performance: null, Quality: null, Efficiency: null },
-        maximizeStats: { Performance: true, Quality: true, Efficiency: true },
+        targetStats: { Performance: 600, Quality: 60, Efficiency: null },
+        maximizeStats: { Performance: false, Quality: false, Efficiency: true },
+        ignoreStats: { Performance: false, Quality: false, Efficiency: false },
+        statPriority: { Performance: 1, Quality: 2, Efficiency: 3 },
     };
 
     const board = initializeBoard(machine.tier);
-    if (targets) {
+    if (benchCase !== 0) {
         const blast: InventoryItem = { id: 'blast', shape: 'Line4', color: 'Grey', displayName: 'Furnace Module (Blast)', effects: ['None', 'None'], effectValues: [0, 0] };
         const locked: InventoryItem = { id: 'lockedsq', shape: 'Square4_Base', color: 'Red', displayName: 'Performance', effects: ['Premium', 'None'], effectValues: [20, 20], isLocked: true };
         inv.push(blast, locked);
