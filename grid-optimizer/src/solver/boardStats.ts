@@ -31,14 +31,15 @@ export interface BoardStats {
     placedPiecesCount: number;
 }
 
-// `inventoryById` is only an optimisation:
-// building it costs one pass over the whole inventory,
+// `inventoryById` and `internalStats` are only optimisations:
+// building them costs one pass over the whole inventory,
 // which the solver would otherwise repeat on every iteration even though a board never holds more than 35 cells
-// Callers that already have it should pass it
+// Callers that already have them should pass them
 export const calculateBoardStats = (
     currentBoard: Board,
     currentInventory: InventoryItem[],
-    inventoryById?: Map<string, InventoryItem>
+    inventoryById?: Map<string, InventoryItem>,
+    internalStats?: Map<string, Stats>
 ): BoardStats => {
     const totals: Stats = { Performance: 0, Quality: 0, Efficiency: 0 };
     const pieceStats = new Map<string, Stats>();
@@ -47,7 +48,7 @@ export const calculateBoardStats = (
     const invById = inventoryById ?? indexInventoryById(currentInventory);
 
     // applyInternalEffects is pure per item but was recomputed for every adjacency test; memoise it for the duration of the call
-    const internalCache = new Map<string, Stats>();
+    const internalCache = internalStats ?? new Map<string, Stats>();
     const internalOf = (item: InventoryItem): Stats => {
         let cached = internalCache.get(item.id);
         if (cached === undefined) {
@@ -193,10 +194,10 @@ export const calculateBoardStats = (
         totals.Efficiency += finalStats.Efficiency;
     }
 
-    nodeAdjacencies.forEach((adjIds, nodeId) => {
+    for (const [nodeId, adjIds] of nodeAdjacencies) {
         let nodeP = 0, nodeQ = 0, nodeE = 0;
 
-        adjIds.forEach(adjId => {
+        for (const adjId of adjIds) {
             const adjacentItemData = placedPieces.get(adjId);
             if (adjacentItemData) {
                 const baseAdj = internalOf(adjacentItemData.item);
@@ -204,7 +205,7 @@ export const calculateBoardStats = (
                 nodeQ += baseAdj.Quality;
                 nodeE += baseAdj.Efficiency;
             }
-        });
+        }
 
         const nodeStat = {
             Performance: roundStat(nodeP * 0.20),
@@ -216,7 +217,7 @@ export const calculateBoardStats = (
         totals.Performance += nodeStat.Performance;
         totals.Quality += nodeStat.Quality;
         totals.Efficiency += nodeStat.Efficiency;
-    });
+    }
 
     return { totals, pieceStats, placedPiecesCount };
 };

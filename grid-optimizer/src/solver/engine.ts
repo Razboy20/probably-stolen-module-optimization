@@ -1,14 +1,21 @@
-import type { InventoryItem, ModuleShape, Stats } from '../types';
-import { type Orientation, applyInternalEffects, PRECOMPUTED_ORIENTATIONS } from '../utils';
-import { type Board, copyBoard } from './board';
-import { type BoardStats, calculateBoardStats, indexInventoryById } from './boardStats';
+import type { InventoryItem, Stats } from '../types';
+import type { Board } from './board';
+import { calculateBoardStats, indexInventoryById } from './boardStats';
+import { type BoardTotals, boardTotals } from './boardTotals';
 import { generateCodeFromState, inventoryForCode } from './codec';
+import { buildDrawRanks, targetedStats } from './draw';
+import { evalPlacement, type PlaceScore } from './evalPlacement';
 import {
-    type MachineConfig, STAT_KEYS, DEFAULT_STAT_PRIORITY, PRIORITY_WEIGHT_STEP,
-    compareTiers, priorityOf, statIsIgnored
+    BOARD_CELLS, MAX_PIECE_CELLS, PLACE_CELL_COUNT, PLACE_CELLS, PLACE_META, PLACE_VALID, placeEntry
+} from './geometry';
+import { EMPTY, fromIndexBoard, LOCKED, toIndexBoard } from './indexBoard';
+import {
+    buildTierPlan, compareTiers, type MachineConfig, objectiveTiers, STAT_KEYS, statIsIgnored, TIER_VECTOR_LENGTH, tierBoost
 } from './objective';
-import { type PlacementContext, buildPlacementContext, evaluatePlacementDelta } from './placement';
-import { buildSearchPool, isSpecialModule } from './pool';
+import { buildSearchPool, MAX_PIECES_PER_BOARD } from './pool';
+import { randomSeed, type Rng, rngBelow, rngCoinFlip, seedRng } from './rng';
+import { buildScoringParams } from './scoring';
+import { buildPoolTables, FLAG_FIXED } from './tables';
 import { createYielder, FRAME_BUDGET_MS, now, TIMER_YIELD_INTERVAL_MS } from './yielder';
 
 // A coordinated multi-machine mode (shared pool consumption, a balance penalty across machines, rebuild-all on stagnation)
@@ -19,23 +26,28 @@ import { createYielder, FRAME_BUDGET_MS, now, TIMER_YIELD_INTERVAL_MS } from './
 // 1 is a uniform draw; higher steers the fill toward high-value modules without ever ruling any out
 const DRAW_TOURNAMENT = 4;
 
-// How much of its draw weight a targeted stat keeps once the target is met
-const TARGET_MET_DRAW_SCALE = 0.25;
-
 // How many stagnations in a row the search rides out on the same board before it gives up on it and starts over from the initial board
 const RESTART_AFTER_STAGNATIONS = 8;
 
 const STAGNATION_LIMIT = 150;
 
-// Unbiased Fisher-Yates
+// Unbiased Fisher-Yates over the first `count` entries
 // `sort(() => Math.random() - 0.5)` is not a shuffle: it leaves the ordering strongly correlated with the input, which narrows the range of layouts the solver actually explores
-const shuffleInPlace = <T,>(arr: T[]) => {
-    for (let i = arr.length - 1; i > 0; i--) {
-        const j = (Math.random() * (i + 1)) | 0;
+const shuffleInPlace = (rng: Rng, arr: Int32Array, count: number) => {
+    for (let i = count - 1; i > 0; i--) {
+        const j = rngBelow(rng, i + 1);
         const tmp = arr[i];
         arr[i] = arr[j];
         arr[j] = tmp;
     }
+};
+
+const bitIsSet = (bits: Uint32Array, i: number) => (bits[i >>> 5] & (1 << (i & 31))) !== 0;
+const setBit = (bits: Uint32Array, i: number) => { bits[i >>> 5] |= 1 << (i & 31); };
+const clearBit = (bits: Uint32Array, i: number) => { bits[i >>> 5] &= ~(1 << (i & 31)); };
+
+const copyTotals = (from: BoardTotals, to: BoardTotals) => {
+    to.p = from.p; to.q = from.q; to.e = from.e; to.pieces = from.pieces;
 };
 
 export interface SolveRequest {
@@ -43,6 +55,7 @@ export interface SolveRequest {
     initialBoard: Board;
     searchPoolInventory: InventoryItem[];
     fullInventory: InventoryItem[];
+    seed?: number;
     maxIterations?: number;
 }
 
@@ -64,253 +77,185 @@ export const runOptimizationEngine = async (
 ): Promise<{ iterations: number }> => {
     const { machine, initialBoard, searchPoolInventory, fullInventory } = request;
     const maxIterations = request.maxIterations ?? Infinity;
+    const rng = seedRng(request.seed ?? randomSeed(), 0);
 
-    const precomputedInternal = new Map<string, Stats>();
-    fullInventory.forEach(item => precomputedInternal.set(item.id, applyInternalEffects(item)));
-
-    const placementContexts = new Map<string, PlacementContext>();
-    fullInventory.forEach(item => placementContexts.set(item.id, buildPlacementContext(item, precomputedInternal)));
+    const tables = buildPoolTables(fullInventory, initialBoard);
+    const inventoryById = indexInventoryById(fullInventory);
 
     // Boards may already hold modules the search itself would not pick up, so the pruned pool is only used for choosing what to place
-    const searchPool = buildSearchPool(searchPoolInventory, precomputedInternal, machine);
-
-    // The inner loops used to key everything off item.id, which meant hashing a string for every pool entry on every iteration
-    // Everything hot is addressed by pool index instead:
-    // the item -> index map is walked once per placed cell (a few dozen), and the per-candidate work becomes a typed-array read
-    const poolIndexOf = new Map<string, number>();
-    searchPool.forEach((item, i) => poolIndexOf.set(item.id, i));
-    const ctxByIndex: PlacementContext[] = searchPool.map(item => placementContexts.get(item.id)!);
-    const orientationsByIndex = searchPool.map(item => PRECOMPUTED_ORIENTATIONS.get(item.shape));
+    const searchPool = buildSearchPool(searchPoolInventory, tables.internal, machine).filter(item => tables.indexOf.has(item.id));
+    const drawList = Int32Array.from(searchPool, item => tables.indexOf.get(item.id)!);
+    const poolCount = drawList.length;
+    let allShapesMask = 0;
+    for (let i = 0; i < poolCount; i++) allShapesMask |= 1 << tables.shape[drawList[i]];
 
     // A board holds at most MAX_PIECES_PER_BOARD pieces, so shuffling the entire pool to fill one was work thrown away
     // This permutation is drawn from a Fisher-Yates that stops as soon as the board can take nothing more
     // and it persists across iterations, staying a valid permutation because a partial shuffle only ever swaps within it
-    const poolOrder = new Int32Array(searchPool.length);
-    for (let i = 0; i < poolOrder.length; i++) poolOrder[i] = i;
-    const poolShapeCount = new Set(searchPool.map(item => item.shape)).size;
-    const inventoryById = indexInventoryById(fullInventory);
+    const poolOrder = new Int32Array(poolCount);
+    for (let i = 0; i < poolCount; i++) poolOrder[i] = i;
 
-    // One tier per distinct rank in play, most important first
-    // With no priorities set this collapses to a single tier holding everything, which is the original objective
-    const activeRanks = new Set<number>();
-    for (const key of STAT_KEYS) {
-        if (!statIsIgnored(machine, key)) activeRanks.add(priorityOf(machine, key));
+    const plan = buildTierPlan(machine);
+    const tierLength = plan.tierCount + 1;
+
+    // A stat marked ignored gets weight 0 so the placement heuristic stops steering away from it at all
+    const placementWeights: Stats = { Performance: 0, Quality: 0, Efficiency: 0 };
+    for (let s = 0; s < 3; s++) {
+        const key = STAT_KEYS[s];
+        if (statIsIgnored(machine, key)) continue;
+        let w = 0;
+        if (machine.maximizeStats[key]) w += 10;
+        if (machine.targetStats[key] !== null) w += 15;
+        placementWeights[key] = w * tierBoost(plan, s);
     }
-    if (activeRanks.size === 0) activeRanks.add(DEFAULT_STAT_PRIORITY);
-    const rankOrder = [...activeRanks].sort((a, b) => a - b);
-    const tierCount = rankOrder.length;
-    const tierOfRank = new Map<number, number>(rankOrder.map((r, i) => [r, i]));
-    const tierOf = (key: keyof Stats) => tierOfRank.get(priorityOf(machine, key))!;
+    const params = buildScoringParams(machine, placementWeights);
+    const targeted = targetedStats(machine);
+    const drawRanks = buildDrawRanks(tables, drawList, machine, plan);
 
-    const currentTiers = new Float64Array(tierCount + 1);
-    // epochTiers is the best this attempt has reached, bestTiers the best ever reached
-    // They are the same thing until the search restarts; (see RESTART_AFTER_STAGNATIONS)
-    const epochTiers = new Float64Array(tierCount + 1).fill(-Infinity);
-    const bestTiers = new Float64Array(tierCount + 1).fill(-Infinity);
-    let currentBoard = copyBoard(initialBoard);
-    let currentStats: BoardStats = calculateBoardStats(currentBoard, fullInventory, inventoryById);
-    let currentCode = '';
-    let codeIsStale = true;
+    // The placement heuristic only reads the running totals to judge distance to a target,
+    // so without one the recalculation after every placement is pure waste
+    const needsTotals = targeted.some(s => !statIsIgnored(machine, STAT_KEYS[s]));
 
+    const initialIndexBoard = toIndexBoard(initialBoard, tables.indexOf);
+    const currentBoard = new Int32Array(initialIndexBoard);
+    // Reused across iterations so the search does not allocate a fresh board per attempt
+    const testBoard = new Int32Array(initialIndexBoard);
     // The best board ever seen, which is what gets reported
     // Once the search can restart, the board it is working on is no longer guaranteed to be the best one found,
     // so the record is kept separately. A restart must never be able to lose a result that has already been shown
-    let bestBoard = copyBoard(currentBoard);
-    let bestStats = currentStats;
+    const bestBoard = new Int32Array(initialIndexBoard);
 
-    // Reused across iterations so the search does not allocate a fresh board per attempt
-    const testBoard = copyBoard(currentBoard);
+    const currentTotals: BoardTotals = { p: 0, q: 0, e: 0, pieces: 0 };
+    const fillTotals: BoardTotals = { p: 0, q: 0, e: 0, pieces: 0 };
+    boardTotals(tables, currentBoard, currentTotals);
+
+    const currentTiers = new Int32Array(TIER_VECTOR_LENGTH);
+    // epochTiers is the best this attempt has reached, bestTiers the best ever reached
+    // They are the same thing until the search restarts; (see RESTART_AFTER_STAGNATIONS)
+    const epochTiers = new Int32Array(TIER_VECTOR_LENGTH);
+    const bestTiers = new Int32Array(TIER_VECTOR_LENGTH);
+    let hasEpoch = false;
+    let hasRecord = false;
 
     let stagnationCounter = 0;
     let stagnationRuns = 0;
 
-    // A stat marked ignored gets weight 0 so the placement heuristic stops steering away from it at all
-    const getW = (key: keyof Stats) => {
-        if (statIsIgnored(machine, key)) return 0;
-        let w = 0;
-        if (machine.maximizeStats[key]) w += 10;
-        if (machine.targetStats[key] !== null) w += 15;
-        return w;
-    };
-    const boost = (key: keyof Stats) =>
-        statIsIgnored(machine, key) ? 1 : Math.pow(PRIORITY_WEIGHT_STEP, tierCount - 1 - tierOf(key));
-    const dynWp = getW('Performance') * boost('Performance');
-    const dynWq = getW('Quality') * boost('Quality');
-    const dynWe = getW('Efficiency') * boost('Efficiency');
-
-    /* What each pool entry is worth to this machine per cell it occupies, used to decide which modules the fill is offered
-     * Board space is the scarce resource, so per-cell is the comparison that matters
-     *
-     * These weights are not the placement weights above, and the difference is the point
-     * The score pays nothing for overshooting a target, so once a target is met, another point of that stat is worth next to nothing for a stat that is only being held to a target
-     * A machine sitting comfortably above P 500 and Q 150 should be offered Efficiency modules, not more of what it already has
-     * The placement heuristic keeps the full target weight in every case, and that is what stops a met target being undercut. This only decides what gets offered to it
-     *
-     * Which targets are met changes as the board moves, so there is one table per combination of met targets (at most eight), built once here, picked by bitmask per fill
-     * Rebuilding a table whenever the totals shifted would costs more than the bias is worth
-     */
-    const targetedKeys = STAT_KEYS.filter(key => machine.targetStats[key] !== null);
-
-    const buildDrawValues = (w: Stats) => {
-        const values = new Float64Array(searchPool.length);
-        const stated: number[] = [];
-        for (let i = 0; i < searchPool.length; i++) {
-            const ctx = ctxByIndex[i];
-            if (ctx.isWhite || ctx.size === 0) continue;
-            const s = ctx.internal;
-            values[i] = (s.Performance * w.Performance + s.Quality * w.Quality
-                + s.Efficiency * w.Efficiency) / ctx.size;
-            stated.push(values[i]);
-        }
-        // Nodes carry no stats of their own: all their worth is the 20% they add to whatever ends up beside them, which only evaluatePlacementDelta can see
-        // Scoring them at the median leaves them drawn about as often as an ordinary module instead of never
-        if (stated.length > 0) {
-            stated.sort((a, b) => a - b);
-            const median = stated[stated.length >> 1];
-            for (let i = 0; i < searchPool.length; i++) {
-                if (ctxByIndex[i].isWhite) values[i] = median;
-            }
-        }
-        return values;
-    };
-
-    const drawValues: Float64Array[] = [];
-    for (let mask = 0; mask < (1 << targetedKeys.length); mask++) {
-        const w: Stats = { Performance: 0, Quality: 0, Efficiency: 0 };
-        for (const key of STAT_KEYS) {
-            if (statIsIgnored(machine, key)) {
-                w[key] = 0;
-                continue;
-            }
-            let v = 0;
-            if (machine.maximizeStats[key]) v += 10;
-            const ti = targetedKeys.indexOf(key);
-            // Bit set means the target is already met, so the push for it is cut back, but never to nothing
-            // The draw decides which modules the fill is even offered,
-            // so a stat whose modules stop being drawn cannot be rebuilt when a ruin knocks it below its target, and every repair after that is rejected
-            if (ti !== -1) v += 15 * ((mask & (1 << ti)) !== 0 ? TARGET_MET_DRAW_SCALE : 1);
-            w[key] = v * Math.pow(PRIORITY_WEIGHT_STEP, tierCount - 1 - tierOf(key));
-        }
-        drawValues.push(buildDrawValues(w));
-    }
-
-    // Scratch buffers, cleared per iteration rather than reallocated
-    // placedMark: pool entries sitting on the board this iteration
-    // Generation-stamped rather than cleared, so a new iteration invalidates every stale entry by bumping a counter instead of walking the array
-    const placedMark = new Int32Array(searchPool.length);
-    let markGen = 0;
-    const piecesOnTarget: InventoryItem[] = [];
-    const seenOnTarget = new Set<string>();
-    const removedIds = new Set<string>();
-    // Every special sitting on the rebuilt board, with the cells it is currently standing on
+    // Scratch, cleared per iteration rather than reallocated
+    // blocked: items sitting on the board this iteration, so the draw skips them
+    const blocked = new Uint32Array((tables.count + 31) >>> 5);
+    // Movable pieces on the board, in the order they are first met
+    const removable = new Int32Array(MAX_PIECES_PER_BOARD);
+    // Every special or locked piece sitting on the rebuilt board, with the cells it is currently standing on
     // They stay put until the fill lifts them one at a time, so the board is never in a state where one is missing
-    const specialsOnBoard: { piece: InventoryItem; cells: number[] }[] = [];
-    const freeCells: number[] = [];
-    // Whether a shape fits is a property of the shape and the free cells, never of the individual module, and filling a board only ever removes free cells
-    // So once one module of a shape finds nowhere to go, every later module of that shape in the same pass finds nowhere either, and can be skipped without scanning
-    const infeasibleShapes = new Set<ModuleShape>();
+    const fixedItem = new Int32Array(MAX_PIECES_PER_BOARD);
+    const fixedCellCount = new Int32Array(MAX_PIECES_PER_BOARD);
+    const fixedCells = new Int32Array(MAX_PIECES_PER_BOARD * MAX_PIECE_CELLS);
+    // Every orientation is normalised so its first cell is the anchor, so only empty cells can anchor a placement
+    // Tracking them prunes the scan as the board fills up
+    const freeCells = new Int32Array(BOARD_CELLS);
+    let freeCount = 0;
+    const score: PlaceScore = { ok: false, major: 0, minor: 0 };
+
     // A board is empty exactly when every cell it has is free, and which cells it has is fixed by its tier
     let openCellCount = 0;
-    for (let y = 0; y < 5; y++) for (let x = 0; x < 7; x++) if (currentBoard[y][x] !== 'Locked') openCellCount++;
+    for (let i = 0; i < BOARD_CELLS; i++) if (initialIndexBoard[i] !== LOCKED) openCellCount++;
 
     // Drops the cells that are no longer free, keeping the rest in scan order
-    const compactFreeCells = (fillBoard: Board) => {
+    const compactFreeCells = () => {
         let write = 0;
-        for (let c = 0; c < freeCells.length; c++) {
-            const idx = freeCells[c];
-            const cx = idx % 7;
-            const cy = (idx - cx) / 7;
-            if (fillBoard[cy][cx] === null) freeCells[write++] = idx;
+        for (let c = 0; c < freeCount; c++) {
+            if (testBoard[freeCells[c]] === EMPTY) freeCells[write++] = freeCells[c];
         }
-        freeCells.length = write;
+        freeCount = write;
     };
 
     /* Commits one piece at its best-scoring placement among the free cells, and reports whether it found one
      * The pool fill and the special-module relocation both go through here on purpose:
      * a special is only allowed to move because the fill can judge where it should go, and it has to judge it on exactly the terms it judges everything else
      *
-     * `incumbent` is where the piece is standing already, for a piece being relocated rather than placed for the first time
+     * `incumbent` is the placement the piece is standing in already, for a piece being relocated rather than placed for the first time
      * It is scored ahead of everything else and the scan only takes a strictly better cell, so a piece with nowhere better to be simply stays
      * Without it the ties decide, and for a module whose score barely varies across the board (which is every special) that means the first cell in scan order:
      * a Line4 lands in the top-left of whatever the ruin opened up, every iteration, taking the best space on the board from the modules that would have earned something with it
      */
-    const placeBestFit = (
-        ctx: PlacementContext,
-        orientations: Orientation[],
-        piece: InventoryItem,
-        fillBoard: Board,
-        fillBoardEmpty: boolean,
-        currentP: number, currentQ: number, currentE: number,
-        incumbent: { x: number; y: number; orientation: Orientation } | null = null
-    ) => {
-        let bestX = -1, bestY = -1;
-        let bestOrientation: Orientation | null = null;
-        let highestHeuristic = incumbent !== null ? -Infinity : 0.0001;
+    const placeBestFit = (item: number, boardIsEmpty: boolean, incumbent: number) => {
+        let bestEntry = -1;
+        let haveScore = incumbent === -1;
+        let bestMajor = 0, bestMinor = 0;
 
-        if (incumbent !== null) {
-            const incumbentScore = evaluatePlacementDelta(
-                ctx, incumbent.x, incumbent.y, incumbent.orientation, fillBoard, fillBoardEmpty,
-                precomputedInternal, dynWp, dynWq, dynWe, currentP, currentQ, currentE, machine
-            );
-            if (incumbentScore !== -Infinity) {
-                highestHeuristic = incumbentScore;
-                bestX = incumbent.x; bestY = incumbent.y;
-                bestOrientation = incumbent.orientation;
+        if (incumbent !== -1) {
+            evalPlacement(tables, incumbent, item, testBoard, boardIsEmpty, params, fillTotals.p, fillTotals.q, fillTotals.e, score);
+            if (score.ok) {
+                haveScore = true;
+                bestMajor = score.major; bestMinor = score.minor;
+                bestEntry = incumbent;
             }
         }
 
-        for (let c = 0; c < freeCells.length; c++) {
-            const idx = freeCells[c];
-            const x = idx % 7;
-            const y = (idx - x) / 7;
+        const orientStart = tables.orientStart[item];
+        const orientEnd = orientStart + tables.orientCount[item];
+        for (let c = 0; c < freeCount; c++) {
+            const anchor = freeCells[c];
+            for (let g = orientStart; g < orientEnd; g++) {
+                const entry = placeEntry(g, anchor);
+                // Most anchors on a 7x5 board are out of bounds for a given orientation, and the table settles it without the scoring call
+                if ((PLACE_META[entry] & PLACE_VALID) === 0) continue;
 
-            for (let o = 0; o < orientations.length; o++) {
-                const orientation = orientations[o];
-                // evaluatePlacementDelta rejects these too, but most anchors on a 7x5 board are out of bounds for a given orientation,
-                // and the bounding box settles it here without the nine-argument call
-                if (x + orientation.minX < 0 || x + orientation.maxX > 6 ||
-                    y + orientation.minY < 0 || y + orientation.maxY > 4) continue;
-
-                const deltaScore = evaluatePlacementDelta(
-                    ctx, x, y, orientation, fillBoard, fillBoardEmpty,
-                    precomputedInternal, dynWp, dynWq, dynWe, currentP, currentQ, currentE, machine
-                );
-                if (deltaScore > highestHeuristic && deltaScore !== -Infinity) {
-                    highestHeuristic = deltaScore;
-                    bestX = x; bestY = y;
-                    bestOrientation = orientation;
+                evalPlacement(tables, entry, item, testBoard, boardIsEmpty, params, fillTotals.p, fillTotals.q, fillTotals.e, score);
+                if (!score.ok) continue;
+                if (!haveScore || score.major > bestMajor || (score.major === bestMajor && score.minor > bestMinor)) {
+                    haveScore = true;
+                    bestMajor = score.major; bestMinor = score.minor;
+                    bestEntry = entry;
                 }
             }
         }
 
-        if (!bestOrientation) return false;
+        if (bestEntry === -1) return false;
 
-        const { xs, ys, count } = bestOrientation;
-        for (let i = 0; i < count; i++) {
-            fillBoard[bestY + ys[i]][bestX + xs[i]] = piece;
-        }
-        compactFreeCells(fillBoard);
+        const cellCount = PLACE_CELL_COUNT[bestEntry];
+        for (let i = 0; i < cellCount; i++) testBoard[PLACE_CELLS[bestEntry * MAX_PIECE_CELLS + i]] = item;
+        compactFreeCells();
         return true;
     };
 
+    // The cells were collected in row-major order, and an orientation's cells are in that same order and anchored on its first cell,
+    // so the cells the piece is standing on say which placement it is standing in
+    const homeEntryOf = (fixed: number) => {
+        const item = fixedItem[fixed];
+        const cellCount = fixedCellCount[fixed];
+        const anchor = fixedCells[fixed * MAX_PIECE_CELLS];
+        const orientEnd = tables.orientStart[item] + tables.orientCount[item];
+        for (let g = tables.orientStart[item]; g < orientEnd; g++) {
+            const entry = placeEntry(g, anchor);
+            if ((PLACE_META[entry] & PLACE_VALID) === 0 || PLACE_CELL_COUNT[entry] !== cellCount) continue;
+            let matches = true;
+            for (let i = 0; i < cellCount; i++) {
+                if (fixedCells[fixed * MAX_PIECE_CELLS + i] !== PLACE_CELLS[entry * MAX_PIECE_CELLS + i]) { matches = false; break; }
+            }
+            if (matches) return entry;
+        }
+        return -1;
+    };
+
+    let currentCode = '';
+    let codeIsStale = true;
     let pendingUpdate = false;
+    let reportedBoard: Board = initialBoard;
     const flushUpdate = () => {
         if (!pendingUpdate) return;
         pendingUpdate = false;
 
         if (codeIsStale) {
+            reportedBoard = fromIndexBoard(bestBoard, tables.items);
             currentCode = generateCodeFromState(
                 machine.tier, machine.maximizeStats, machine.targetStats,
-                inventoryForCode(fullInventory, bestBoard), bestBoard
+                inventoryForCode(fullInventory, reportedBoard), reportedBoard
             );
             codeIsStale = false;
         }
-        onUpdate({
-            board: copyBoard(bestBoard),
-            totals: bestStats.totals,
-            pieceStats: bestStats.pieceStats,
-            code: currentCode
-        });
+        const { totals, pieceStats } = calculateBoardStats(reportedBoard, fullInventory, inventoryById, tables.internal);
+        onUpdate({ board: reportedBoard, totals, pieceStats, code: currentCode });
     };
 
     const { portYield, timerYield, dispose } = createYielder();
@@ -323,80 +268,61 @@ export const runOptimizationEngine = async (
             iterations++;
             const isStagnant = stagnationCounter >= STAGNATION_LIMIT;
 
-            for (let y = 0; y < 5; y++) {
-                const srcRow = currentBoard[y];
-                const dstRow = testBoard[y];
-                for (let x = 0; x < 7; x++) dstRow[x] = srcRow[x];
-            }
+            testBoard.set(currentBoard);
+            blocked.fill(0);
 
-            markGen++;
+            let removableCount = 0;
+            let fixedCount = 0;
+            for (let i = 0; i < BOARD_CELLS; i++) {
+                const item = testBoard[i];
+                if (item < 0) continue;
 
-            piecesOnTarget.length = 0;
-            seenOnTarget.clear();
-            specialsOnBoard.length = 0;
-
-            for (let y = 0; y < 5; y++) {
-                for (let x = 0; x < 7; x++) {
-                    const cell = testBoard[y][x];
-                    if (!cell || cell === 'Locked') continue;
-
-                    /* A special is offered a better cell every iteration instead of taking a share of the ruin's removal budget
-                     * It is not the ruin's kind of move: the ruin takes a piece away and lets the fill find something better to do with the space,
-                     * and a special is going straight back down whatever happens. Spending a removal on one only means one fewer real piece is reconsidered that iteration
-                     */
-                    if (isSpecialModule(cell) || cell.isLocked) {
-                        let entry = specialsOnBoard.find(e => e.piece.id === cell.id);
-                        if (entry === undefined) {
-                            entry = { piece: cell, cells: [] };
-                            specialsOnBoard.push(entry);
-                        }
-                        entry.cells.push(y * 7 + x);
-                        continue;
+                /* A special is offered a better cell every iteration instead of taking a share of the ruin's removal budget
+                 * It is not the ruin's kind of move: the ruin takes a piece away and lets the fill find something better to do with the space,
+                 * and a special is going straight back down whatever happens. Spending a removal on one only means one fewer real piece is reconsidered that iteration
+                 */
+                if ((tables.flags[item] & FLAG_FIXED) !== 0) {
+                    let f = 0;
+                    while (f < fixedCount && fixedItem[f] !== item) f++;
+                    if (f === fixedCount) {
+                        fixedItem[fixedCount] = item;
+                        fixedCellCount[fixedCount] = 0;
+                        fixedCount++;
                     }
+                    fixedCells[f * MAX_PIECE_CELLS + fixedCellCount[f]++] = i;
+                    continue;
+                }
 
-                    if (!seenOnTarget.has(cell.id)) {
-                        seenOnTarget.add(cell.id);
-                        piecesOnTarget.push(cell);
-                    }
+                if (!bitIsSet(blocked, item)) {
+                    setBit(blocked, item);
+                    removable[removableCount++] = item;
                 }
             }
 
-            if (piecesOnTarget.length > 0) {
+            if (removableCount > 0) {
+                // A stagnant board loses half to nine tenths of its pieces, an ordinary iteration one to three
                 const removeCount = isStagnant
-                    ? Math.max(1, Math.floor(piecesOnTarget.length * (0.5 + Math.random() * 0.4)))
-                    : Math.floor(Math.random() * Math.min(3, piecesOnTarget.length)) + 1;
+                    ? Math.max(1, Math.trunc(removableCount * (50 + rngBelow(rng, 40)) / 100))
+                    : rngBelow(rng, Math.min(3, removableCount)) + 1;
 
-                shuffleInPlace(piecesOnTarget);
-                removedIds.clear();
-                for (let i = 0; i < removeCount; i++) removedIds.add(piecesOnTarget[i].id);
+                shuffleInPlace(rng, removable, removableCount);
+                for (let i = 0; i < removeCount; i++) clearBit(blocked, removable[i]);
 
-                for (let y = 0; y < 5; y++) {
-                    for (let x = 0; x < 7; x++) {
-                        const cell = testBoard[y][x];
-                        if (cell && cell !== 'Locked') {
-                            if (removedIds.has(cell.id)) {
-                                testBoard[y][x] = null;
-                            } else {
-                                const pIdx = poolIndexOf.get(cell.id);
-                                if (pIdx !== undefined) placedMark[pIdx] = markGen;
-                            }
-                        }
-                    }
+                for (let i = 0; i < BOARD_CELLS; i++) {
+                    const item = testBoard[i];
+                    if (item >= 0 && (tables.flags[item] & FLAG_FIXED) === 0 && !bitIsSet(blocked, item)) testBoard[i] = EMPTY;
                 }
             }
 
-            // Every orientation is normalised so its first cell is the anchor, so only empty cells can anchor a placement
-            // Tracking them prunes the scan as the board fills up
-            freeCells.length = 0;
-            for (let y = 0; y < 5; y++) {
-                for (let x = 0; x < 7; x++) {
-                    if (testBoard[y][x] === null) freeCells.push(y * 7 + x);
-                }
+            freeCount = 0;
+            for (let i = 0; i < BOARD_CELLS; i++) {
+                if (testBoard[i] === EMPTY) freeCells[freeCount++] = i;
             }
-            shuffleInPlace(freeCells);
-            let fillBoardEmpty = freeCells.length === openCellCount;
+            shuffleInPlace(rng, freeCells, freeCount);
+            let boardIsEmpty = freeCount === openCellCount;
 
-            let currentTotals = calculateBoardStats(testBoard, fullInventory, inventoryById).totals;
+            if (needsTotals) boardTotals(tables, testBoard, fillTotals);
+            else fillTotals.p = fillTotals.q = fillTotals.e = 0;
 
             /* The board's specials, offered a better cell one at a time and before anything is drawn
              *
@@ -405,123 +331,89 @@ export const runOptimizationEngine = async (
              * first one take the second one's cells and leave the second with nowhere guaranteed to go
              * Going before the draw also means they choose out of the whole ruined area rather than whatever the fill leaves over
              */
-            for (const special of specialsOnBoard) {
-                const ctx = placementContexts.get(special.piece.id);
-                const orientations = PRECOMPUTED_ORIENTATIONS.get(special.piece.shape);
-                if (ctx === undefined || orientations === undefined) continue;
-
-                // The cells were collected in row-major order, and an orientation's offsets are in that same order and anchored on its first cell,
-                // so the cells the piece is standing on say which orientation it is standing in
-                const anchor = special.cells[0];
-                const homeX = anchor % 7;
-                const homeY = (anchor - homeX) / 7;
-                let home: Orientation | null = null;
-                for (const orientation of orientations) {
-                    if (orientation.count !== special.cells.length) continue;
-                    let matches = true;
-                    for (let i = 0; i < orientation.count; i++) {
-                        if (special.cells[i] !== anchor + orientation.ys[i] * 7 + orientation.xs[i]) { matches = false; break; }
-                    }
-                    if (matches) { home = orientation; break; }
+            for (let f = 0; f < fixedCount; f++) {
+                const home = homeEntryOf(f);
+                for (let c = 0; c < fixedCellCount[f]; c++) {
+                    const idx = fixedCells[f * MAX_PIECE_CELLS + c];
+                    testBoard[idx] = EMPTY;
+                    freeCells[freeCount++] = idx;
                 }
-
-                for (const idx of special.cells) {
-                    const cx = idx % 7;
-                    testBoard[(idx - cx) / 7][cx] = null;
-                    freeCells.push(idx);
-                }
-                placeBestFit(
-                    ctx, orientations, special.piece, testBoard, fillBoardEmpty,
-                    currentTotals.Performance, currentTotals.Quality, currentTotals.Efficiency,
-                    home === null ? null : { x: homeX, y: homeY, orientation: home }
-                );
-                fillBoardEmpty = false;
-                currentTotals = calculateBoardStats(testBoard, fullInventory, inventoryById).totals;
+                placeBestFit(fixedItem[f], boardIsEmpty, home);
+                boardIsEmpty = false;
+                if (needsTotals) boardTotals(tables, testBoard, fillTotals);
             }
 
-            infeasibleShapes.clear();
+            // Whether a shape fits is a property of the shape and the free cells, never of the individual module, and filling a board only ever removes free cells
+            // So once one module of a shape finds nowhere to go, every later module of that shape in the same pass finds nowhere either, and can be skipped without scanning
+            let infeasibleShapes = 0;
 
             // Which of the machine's targets the accepted board already meets picks the draw table, so the fill stops being offered more of a stat it has enough of
             let metMask = 0;
-            for (let i = 0; i < targetedKeys.length; i++) {
-                const key = targetedKeys[i];
-                if (currentStats.totals[key] >= machine.targetStats[key]!) {
-                    metMask |= 1 << i;
-                }
+            for (let i = 0; i < targeted.length; i++) {
+                const s = targeted[i];
+                const t = s === 0 ? currentTotals.p : s === 1 ? currentTotals.q : currentTotals.e;
+                if (t >= params.target[s]) metMask |= 1 << i;
             }
-            const values = drawValues[metMask];
+            const ranks = drawRanks[metMask];
 
             // Stops once every shape in the pool has been shown to fit nowhere, which cannot change while the board is only losing free cells
             let drawn = 0;
-            while (drawn < poolOrder.length && infeasibleShapes.size < poolShapeCount) {
+            while (drawn < poolCount && (infeasibleShapes & allShapesMask) !== allShapesMask) {
                 // Best of DRAW_TOURNAMENT random candidates rather than the first one drawn
                 // The permutation is still only partially shuffled, so the losers stay in the undrawn region and can be picked again later this fill
-                const remaining = poolOrder.length - drawn;
-                let swapAt = drawn + Math.floor(Math.random() * remaining);
+                const remaining = poolCount - drawn;
+                let swapAt = drawn + rngBelow(rng, remaining);
                 for (let t = 1; t < DRAW_TOURNAMENT && t < remaining; t++) {
-                    const alt = drawn + Math.floor(Math.random() * remaining);
-                    if (values[poolOrder[alt]] > values[poolOrder[swapAt]]) swapAt = alt;
+                    const alt = drawn + rngBelow(rng, remaining);
+                    if (ranks[poolOrder[alt]] > ranks[poolOrder[swapAt]]) swapAt = alt;
                 }
-                const pieceIdx = poolOrder[swapAt];
+                const pos = poolOrder[swapAt];
                 poolOrder[swapAt] = poolOrder[drawn];
-                poolOrder[drawn] = pieceIdx;
+                poolOrder[drawn] = pos;
                 drawn++;
 
-                if (placedMark[pieceIdx] === markGen) continue;
+                const item = drawList[pos];
+                if (bitIsSet(blocked, item)) continue;
 
-                const piece = searchPool[pieceIdx];
-                if (infeasibleShapes.has(piece.shape)) continue;
+                const shapeBit = 1 << tables.shape[item];
+                if ((infeasibleShapes & shapeBit) !== 0) continue;
 
-                const ctx = ctxByIndex[pieceIdx];
                 // Too few cells left for this shape is itself a permanent verdict on it
-                if (freeCells.length < ctx.size) {
-                    infeasibleShapes.add(piece.shape);
+                if (freeCount < tables.size[item]) {
+                    infeasibleShapes |= shapeBit;
                     continue;
                 }
 
-                const orientations = orientationsByIndex[pieceIdx];
-                if (!orientations) continue;
-
-                if (placeBestFit(ctx, orientations, piece, testBoard, fillBoardEmpty, currentTotals.Performance, currentTotals.Quality, currentTotals.Efficiency)) {
-                    fillBoardEmpty = false;
-                    currentTotals = calculateBoardStats(testBoard, fullInventory, inventoryById).totals;
+                if (placeBestFit(item, boardIsEmpty, -1)) {
+                    boardIsEmpty = false;
+                    if (needsTotals) boardTotals(tables, testBoard, fillTotals);
                 } else {
-                    infeasibleShapes.add(piece.shape);
+                    infeasibleShapes |= shapeBit;
                 }
             }
 
-            const rebuiltStats = calculateBoardStats(testBoard, fullInventory, inventoryById);
-
-            currentTiers.fill(0);
-            const t = rebuiltStats.totals;
-            for (const key of STAT_KEYS) {
-                if (statIsIgnored(machine, key)) continue;
-
-                const ti = tierOf(key);
-                const target = machine.targetStats[key];
-                if (target !== null && t[key] < target) currentTiers[ti] -= (target - t[key]) * 10000;
-                if (machine.maximizeStats[key]) currentTiers[ti] += (t[key] * 10);
-            }
-
-            // Density reward: a general tiebreak, so it sits in the least important tier and can never take a ranked stat out of its own tier
-            currentTiers[tierCount] -= rebuiltStats.placedPiecesCount * 5;
+            boardTotals(tables, testBoard, fillTotals);
+            objectiveTiers(fillTotals, plan, params, currentTiers);
 
             if (!control.running) break;
 
             // Judged against the best of THIS attempt, not the best ever
             // After a restart the board is deliberately worse than the record, and comparing it to the record would reject every move and leave the restart unable to climb at all
-            const ordering = compareTiers(currentTiers, epochTiers);
+            const ordering = hasEpoch ? compareTiers(currentTiers, epochTiers, tierLength) : 1;
             const improved = ordering > 0;
-            if (improved || (ordering === 0 && Math.random() > 0.5)) {
-                if (improved) epochTiers.set(currentTiers);
-                currentBoard = copyBoard(testBoard);
-                currentStats = rebuiltStats;
+            if (improved || (ordering === 0 && rngCoinFlip(rng))) {
+                if (improved) {
+                    epochTiers.set(currentTiers);
+                    hasEpoch = true;
+                }
+                currentBoard.set(testBoard);
+                copyTotals(fillTotals, currentTotals);
 
                 // A new record is the only thing worth reporting, and the only thing that resets the stagnation count
-                if (improved && compareTiers(currentTiers, bestTiers) > 0) {
+                if (improved && (!hasRecord || compareTiers(currentTiers, bestTiers, tierLength) > 0)) {
                     bestTiers.set(currentTiers);
-                    bestBoard = copyBoard(currentBoard);
-                    bestStats = currentStats;
+                    hasRecord = true;
+                    bestBoard.set(currentBoard);
                     codeIsStale = true;
                     pendingUpdate = true;
                     stagnationCounter = 0;
@@ -540,9 +432,9 @@ export const runOptimizationEngine = async (
                 // The record is already banked in bestBoard, so a restart can only cost time, never a result
                 if (++stagnationRuns >= RESTART_AFTER_STAGNATIONS) {
                     stagnationRuns = 0;
-                    epochTiers.fill(-Infinity);
-                    currentBoard = copyBoard(initialBoard);
-                    currentStats = calculateBoardStats(currentBoard, fullInventory, inventoryById);
+                    hasEpoch = false;
+                    currentBoard.set(initialIndexBoard);
+                    boardTotals(tables, currentBoard, currentTotals);
                 }
             }
 

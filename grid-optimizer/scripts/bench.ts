@@ -57,7 +57,7 @@ for (const ms of [250, 1000, 3000, 10000]) {
 
 const t0 = performance.now();
 const { iterations } = await runOptimizationEngine(
-    { machine, initialBoard: board, searchPoolInventory: inv, fullInventory: inv, maxIterations: ITERS || undefined },
+    { machine, initialBoard: board, searchPoolInventory: inv, fullInventory: inv, seed: SEED, maxIterations: ITERS || undefined },
     control,
     (u) => { latest = u; }
 );
