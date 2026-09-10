@@ -56,6 +56,8 @@ export interface SolveRequest {
     searchPoolInventory: InventoryItem[];
     fullInventory: InventoryItem[];
     seed?: number;
+    // Which stream of the seed this solve follows, so a population of solves can share one seed and still diverge
+    thread?: number;
     maxIterations?: number;
 }
 
@@ -68,6 +70,8 @@ export interface SolveUpdate {
     totals: Stats;
     pieceStats: Map<string, Stats>;
     code: string;
+    // The record's objective, so a host running several solves can tell which report is the best
+    tiers: number[];
 }
 
 export const runOptimizationEngine = async (
@@ -77,7 +81,7 @@ export const runOptimizationEngine = async (
 ): Promise<{ iterations: number }> => {
     const { machine, initialBoard, searchPoolInventory, fullInventory } = request;
     const maxIterations = request.maxIterations ?? Infinity;
-    const rng = seedRng(request.seed ?? randomSeed(), 0);
+    const rng = seedRng(request.seed ?? randomSeed(), request.thread ?? 0);
 
     const tables = buildPoolTables(fullInventory, initialBoard);
     const inventoryById = indexInventoryById(fullInventory);
@@ -255,7 +259,7 @@ export const runOptimizationEngine = async (
             codeIsStale = false;
         }
         const { totals, pieceStats } = calculateBoardStats(reportedBoard, fullInventory, inventoryById, tables.internal);
-        onUpdate({ board: reportedBoard, totals, pieceStats, code: currentCode });
+        onUpdate({ board: reportedBoard, totals, pieceStats, code: currentCode, tiers: Array.from(bestTiers.subarray(0, tierLength)) });
     };
 
     const { portYield, timerYield, dispose } = createYielder();

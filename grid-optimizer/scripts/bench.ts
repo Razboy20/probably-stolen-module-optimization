@@ -1,4 +1,5 @@
-import { runOptimizationEngine, type SolveUpdate } from '../src/solver/engine';
+import type { SolveUpdate } from '../src/solver/engine';
+import { runSolver, type SolverBackend } from '../src/solver/client';
 import { initializeBoard } from '../src/solver/board';
 import type { MachineConfig } from '../src/solver/objective';
 import { EFFECTS_LIST, MODULE_TEMPLATES } from '../src/constants';
@@ -10,6 +11,8 @@ const N = Number(process.env.N ?? 200);
 const MS = Number(process.env.MS ?? 3000);
 const ITERS = Number(process.env.ITERS ?? 0);
 const TARGETS = process.env.TARGETS === '1';
+const IMPL = (process.env.IMPL ?? 'inline') as SolverBackend;
+const WORKERS = process.env.WORKERS ? Number(process.env.WORKERS) : undefined;
 
 let seed = SEED * 7919 + 12345;
 const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
@@ -46,8 +49,6 @@ if (TARGETS) {
     board[0][5] = board[0][6] = board[1][5] = board[1][6] = locked;
 }
 
-const control = { running: true };
-if (ITERS === 0) setTimeout(() => { control.running = false; }, MS);
 
 let latest = null as SolveUpdate | null;
 const checkpoints: Record<string, Stats | null> = {};
@@ -56,17 +57,20 @@ for (const ms of [250, 1000, 3000, 10000]) {
 }
 
 const t0 = performance.now();
-const { iterations } = await runOptimizationEngine(
+const solver = runSolver(
     { machine, initialBoard: board, searchPoolInventory: inv, fullInventory: inv, seed: SEED, maxIterations: ITERS || undefined },
-    control,
-    (u) => { latest = u; }
+    (u) => { latest = u; },
+    IMPL,
+    WORKERS
 );
+if (ITERS === 0) setTimeout(() => solver.stop(), MS);
+const { iterations } = await solver.done;
 const dt = performance.now() - t0;
 
 const fnv = (s: string) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(16); };
 const cells = latest ? latest.board.flat().map(c => c && c !== 'Locked' ? c.id : (c ?? '.')).join(',') : '';
 console.log(JSON.stringify({
-    seed: SEED, N, targets: TARGETS, ms: Math.round(dt), iterations,
+    seed: SEED, N, targets: TARGETS, impl: IMPL, workers: WORKERS, ms: Math.round(dt), iterations,
     itersPerSec: Math.round(iterations / (dt / 1000)),
     fingerprint: fnv(cells), totals: latest?.totals, checkpoints: ITERS ? undefined : checkpoints,
 }));

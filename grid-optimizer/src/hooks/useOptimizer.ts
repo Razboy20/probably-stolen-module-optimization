@@ -4,7 +4,7 @@ import { saveToDatabase } from '../leaderboard';
 import { type Board, initializeBoard } from '../solver/board';
 import { calculateBoardStats, indexInventoryById } from '../solver/boardStats';
 import { decodeSolution, generateCodeFromState, inventoryForCode } from '../solver/codec';
-import { type SolveControl, runOptimizationEngine } from '../solver/engine';
+import { runSolver, type SolverHandle } from '../solver/client';
 
 export function useOptimizer(
     inventory: InventoryItem[],
@@ -67,7 +67,7 @@ export function useOptimizer(
     const [isSolving, setIsSolving] = useState(false);
     const [warningMsg, setWarningMsg] = useState<string | null>(null);
     const [solutionCode, setSolutionCode] = useState<string>('');
-    const controlRef = useRef<SolveControl>({ running: false });
+    const solverRef = useRef<SolverHandle | null>(null);
 
     const getAvailableInventory = () => {
         if (!getUsedItems || !machineId) return inventory.filter(i => !i.isLocked);
@@ -90,7 +90,7 @@ export function useOptimizer(
 
     const resetBoard = () => {
         if (isSolving) {
-            controlRef.current.running = false;
+            solverRef.current?.stop();
             setIsSolving(false);
         }
         setBoardSync(initializeBoard(tier));
@@ -106,7 +106,7 @@ export function useOptimizer(
     };
 
     const stopOptimization = () => {
-        controlRef.current.running = false;
+        solverRef.current?.stop();
         setIsSolving(false);
     };
 
@@ -240,7 +240,7 @@ export function useOptimizer(
 
     const runOptimization = async () => {
         if (isSolving) {
-            controlRef.current.running = false;
+            solverRef.current?.stop();
             return;
         }
 
@@ -266,14 +266,11 @@ export function useOptimizer(
         setSolutionCode('');
         setWarningMsg(null);
         setIsSolving(true);
-        const control: SolveControl = { running: true };
-        controlRef.current = control;
 
         const machine = { id: machineId, tier, targetStats, maximizeStats, ignoreStats, statPriority };
 
-        await runOptimizationEngine(
+        const solver = runSolver(
             { machine, initialBoard: boardRef.current, searchPoolInventory: engineInventory, fullInventory: fullInventoryForMachine },
-            control,
             (update) => {
                 setBoardSync(update.board);
                 setBestTotals(update.totals);
@@ -281,6 +278,13 @@ export function useOptimizer(
                 setSolutionCode(update.code);
             }
         );
+        solverRef.current = solver;
+        try {
+            await solver.done;
+        } catch (error) {
+            console.error(error);
+            setWarningMsg('The optimizer stopped unexpectedly.');
+        }
 
         setIsSolving(false);
     };

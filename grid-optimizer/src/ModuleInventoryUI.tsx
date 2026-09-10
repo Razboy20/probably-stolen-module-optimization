@@ -5,6 +5,7 @@ import { formatStatValue, getStatColor, getBaseStats, PRECOMPUTED_OFFSETS } from
 import { useOptimizer } from './hooks/useOptimizer';
 import MiniShape from './components/MiniShape';
 import SaveFileImporter from './components/SaveFileImporter';
+import BackendSelect from './components/BackendSelect';
 
 // offload mouse tracking to useRef; performance
 const DragGhost = ({ dragState, cellSize }: { dragState: any, cellSize: number }) => {
@@ -1566,6 +1567,7 @@ export default function ModuleInventoryUI() {
                     + Add Machine
                 </button>
                 <SaveFileImporter onImport={handleImportSave} />
+                <BackendSelect disabled={isAnySolving} />
             </div>
 
             <div
