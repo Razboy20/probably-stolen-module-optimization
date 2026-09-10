@@ -229,7 +229,6 @@ const MachineInstance = React.memo(forwardRef(({
         }),
         isValidPlacement: optimizer.isValidPlacement,
         getBoard: () => optimizer.boardRef.current,
-        applyUpdate: optimizer.applyUpdate,
         isLocked: () => isMachineLocked
     }), [optimizer, isMachineLocked]);
 
