@@ -3,6 +3,7 @@ import type { Stats, GridTier, InventoryItem, FilterGroup, ItemEffect, ModuleTem
 import { COLOR_MAP, EFFECTS_LIST, MODULE_TEMPLATES, NODE_TEMPLATE } from './constants';
 import { formatStatValue, getStatColor, getBaseStats, PRECOMPUTED_OFFSETS } from './utils';
 import { useOptimizer } from './hooks/useOptimizer';
+import { useJointSolve } from './hooks/useJointSolve';
 import MiniShape from './components/MiniShape';
 import SaveFileImporter from './components/SaveFileImporter';
 import BackendSelect from './components/BackendSelect';
@@ -171,10 +172,11 @@ const MachineInstance = React.memo(forwardRef(({
                                                    onDuplicate,
                                                    onDelete,
                                                    cellSize,
-                                                   onSolvingChange,
+                                                   onRun,
+                                                   onStop,
                                                    onDragTargetRefChange,
                                                    isAnySolving,
-                                                   isThisMachineSolving,
+                                                   isSolving,
                                                    canDelete
                                                }: any, ref) => {
     // Machine state loading handles fallback defaults from localStorage automatically
@@ -187,7 +189,7 @@ const MachineInstance = React.memo(forwardRef(({
         return localStorage.getItem(`optimizer_machine_locked_${machineId}`) === 'true';
     });
 
-    const currentSolving = optimizer.isSolving || isThisMachineSolving;
+    const currentSolving: boolean = isSolving;
 
     // Automatically load the machine name from save file
     const [machineType, setMachineType] = useState(() => {
@@ -216,8 +218,8 @@ const MachineInstance = React.memo(forwardRef(({
     }, [showPaths, optimizer.board]);
 
     useImperativeHandle(ref, () => ({
-        run: optimizer.runOptimization,
-        stop: optimizer.stopOptimization,
+        applyUpdate: optimizer.applyUpdate,
+        setWarning: optimizer.setWarningMsg,
         clear: optimizer.resetBoard,
         place: optimizer.manuallyPlaceItem,
         remove: optimizer.manuallyRemoveItem,
@@ -240,10 +242,6 @@ const MachineInstance = React.memo(forwardRef(({
             setLocalHover(null);
         }
     }, [dragState, machineId]);
-
-    useEffect(() => {
-        onSolvingChange(machineId, optimizer.isSolving);
-    }, [optimizer.isSolving, machineId, onSolvingChange]);
 
     const getCellStyles = (x: number, y: number, cell: any): React.CSSProperties => {
         if (cell === 'Locked') {
@@ -638,14 +636,7 @@ const MachineInstance = React.memo(forwardRef(({
 
                     <div style={{ display: 'flex', gap: '5px', width: '100%' }}>
                         <button
-                            onClick={() => {
-                                if (currentSolving) {
-                                    optimizer.stopOptimization();
-                                    onSolvingChange(machineId, false);
-                                } else {
-                                    optimizer.runOptimization();
-                                }
-                            }}
+                            onClick={() => (currentSolving ? onStop(machineId) : onRun(machineId))}
                             disabled={inventory.length === 0 && !currentSolving}
                             style={{
                                 flex: 2, padding: '8px', fontSize: '0.85em',
@@ -788,7 +779,6 @@ export default function ModuleInventoryUI() {
     }, [machines]);
 
     const machinesRef = useRef<Record<string, any>>({});
-    const [solvingStates, setSolvingStates] = useState<Record<string, boolean>>({});
 
     const getUsedItems = useCallback((excludeId?: string | null) => {
         const used = new Set<string>();
@@ -851,7 +841,9 @@ export default function ModuleInventoryUI() {
     const hoveredItem = hoverInfo ? (expandedInventory.find(i => i.id === hoverInfo.cell.id) || hoverInfo.cell) : null;
     const dragRef = useRef(dragState);
 
-    const isAnySolving = Object.values(solvingStates).some(s => s);
+    const jointSolve = useJointSolve(machinesRef, expandedInventory);
+    const isAnySolving = jointSolve.solvingIds.size > 0;
+    const runMachine = useCallback((id: string) => jointSolve.start([id]), [jointSolve.start]);
 
     useEffect(() => { dragRef.current = dragState; }, [dragState]);
 
@@ -1204,7 +1196,6 @@ export default function ModuleInventoryUI() {
         });
 
         machinesRef.current = {};
-        setSolvingStates({});
     }, []);
 
     const shouldPushNodeToEnd = filterGroup !== 'All';
@@ -1214,13 +1205,9 @@ export default function ModuleInventoryUI() {
 
     const handleRunAll = () => {
         if (isAnySolving) {
-            Object.values(machinesRef.current).forEach((m: any) => m?.stop());
+            jointSolve.stopAll();
         } else {
-            Object.values(machinesRef.current).forEach((m: any) => {
-                if (m && typeof m.isLocked === 'function' && !m.isLocked()) {
-                    m.run();
-                }
-            });
+            jointSolve.start(Object.entries(machinesRef.current).filter(([, m]) => m && !m.isLocked()).map(([id]) => id));
         }
     };
 
@@ -1253,18 +1240,12 @@ export default function ModuleInventoryUI() {
         if (preservedMachines.length === 0) {
             preservedMachines.push({ id: `m_${Math.random().toString(36).substring(2,8)}` });
             machinesRef.current = {};
-            setSolvingStates({});
         } else {
             const nextRefs: Record<string, any> = {};
-            const nextSolving: Record<string, boolean> = {};
-
             preservedMachines.forEach(m => {
                 if (machinesRef.current[m.id]) nextRefs[m.id] = machinesRef.current[m.id];
-                if (solvingStates[m.id]) nextSolving[m.id] = solvingStates[m.id];
             });
-
             machinesRef.current = nextRefs;
-            setSolvingStates(nextSolving);
         }
 
         setMachines(preservedMachines);
@@ -1280,22 +1261,11 @@ export default function ModuleInventoryUI() {
     const handleDeleteMachine = useCallback((machineId: string) => {
         setMachines(prev => prev.filter(m => m.id !== machineId));
         delete machinesRef.current[machineId];
-        setSolvingStates(prev => {
-            const next = { ...prev };
-            delete next[machineId];
-            return next;
-        });
         localStorage.removeItem(`optimizer_machine_${machineId}`);
         localStorage.removeItem(`optimizer_machine_type_${machineId}`);
         localStorage.removeItem(`optimizer_machine_locked_${machineId}`);
     }, []);
 
-    const handleSolvingChange = useCallback((id: string, solving: boolean) => {
-        setSolvingStates(prev => {
-            if (prev[id] === solving) return prev;
-            return { ...prev, [id]: solving };
-        });
-    }, []);
 
     const cellSize = machines.length <= 2 ? 50 : (machines.length <= 4 ? 40 : 35);
 
@@ -1525,10 +1495,11 @@ export default function ModuleInventoryUI() {
                         onDuplicate={handleDuplicateMachine}
                         onDelete={handleDeleteMachine}
                         cellSize={cellSize}
-                        onSolvingChange={handleSolvingChange}
+                        onRun={runMachine}
+                        onStop={jointSolve.stop}
                         onDragTargetRefChange={setDragTargetRefChange}
                         isAnySolving={isAnySolving}
-                        isThisMachineSolving={solvingStates[m.id] || false}
+                        isSolving={jointSolve.solvingIds.has(m.id)}
                         canDelete={machines.length > 1}
                     />
                 ))}

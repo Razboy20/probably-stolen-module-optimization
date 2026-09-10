@@ -13,7 +13,7 @@ export interface ScoringParams {
     maximize: Int32Array;
 }
 
-export const buildScoringParams = (machine: MachineConfig, weights: Stats): ScoringParams => {
+export const buildScoringParams = (machine: MachineConfig, weights: Stats, targetCap = MAX_TARGET): ScoringParams => {
     const params: ScoringParams = {
         w: new Int32Array(3), target: new Int32Array(3), hasTarget: new Int32Array(3), maximize: new Int32Array(3)
     };
@@ -23,7 +23,7 @@ export const buildScoringParams = (machine: MachineConfig, weights: Stats): Scor
         const target = machine.targetStats[key];
         if (target !== null) {
             params.hasTarget[s] = 1;
-            params.target[s] = Math.min(MAX_TARGET, Math.ceil(target));
+            params.target[s] = Math.min(targetCap, Math.ceil(target));
         }
         params.maximize[s] = machine.maximizeStats[key] ? 1 : 0;
     }

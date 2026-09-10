@@ -2,18 +2,39 @@ import tgpu, { d } from 'typegpu';
 import { BOARD_CELLS, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, SHAPE_COUNT } from '../geometry';
 import { TIER_VECTOR_LENGTH } from '../objective';
 import { MAX_PIECES_PER_BOARD } from '../pool';
-import { BLOCKED_WORDS } from './layout';
+import { BLOCKED_WORDS, MAX_MACHINES } from './layout';
 
 // Everything one thread keeps between the functions of an iteration: WGSL has no closures, so the kernel's working state lives in private variables
 const i32s = (n: number) => tgpu.privateVar(d.arrayOf(d.i32, n), d.arrayOf(d.i32, n)());
 const i32v = () => tgpu.privateVar(d.i32, 0);
 
-// The accepted board and the board being built from it
-export const cur = i32s(BOARD_CELLS);
+// The accepted board set, the board of it being rebuilt this iteration, and the one board the fill works on
+export const cur = i32s(BOARD_CELLS * MAX_MACHINES);
 export const test = i32s(BOARD_CELLS);
-export const curP = i32v(), curQ = i32v(), curE = i32v(), curPieces = i32v();
-export const fillP = i32v(), fillQ = i32v(), fillE = i32v();
+export const board = i32v();
+// What the kernel reads about the machine whose board is in test, rebound when another board is scored
+export const mOpenCellCount = i32v(), mTierCount = i32v(), mNeedsTotals = i32v(), mDrawCount = i32v();
+export const mDrawListOffset = i32v(), mShapeStartOffset = i32v(), mDrawRankOffset = i32v(), mStatOffset = i32v(), mDrawableOffset = i32v();
 
+// The accepted totals and tier vector of every board, so only the boards touched this iteration are rescored
+export const curP = i32s(MAX_MACHINES), curQ = i32s(MAX_MACHINES), curE = i32s(MAX_MACHINES), curPieces = i32s(MAX_MACHINES);
+export const boardTiers = i32s(TIER_VECTOR_LENGTH * MAX_MACHINES);
+export const fillP = i32v(), fillQ = i32v(), fillE = i32v();
+// The rebuilt board's totals and tiers once the fill is done, and the same for the board a steal took from
+export const builtP = i32v(), builtQ = i32v(), builtE = i32v(), builtPieces = i32v();
+export const builtTiers = i32s(TIER_VECTOR_LENGTH);
+export const built = i32s(BOARD_CELLS);
+export const robbed = i32v();
+export const robbedP = i32v(), robbedQ = i32v(), robbedE = i32v(), robbedPieces = i32v();
+export const robbedTiers = i32s(TIER_VECTOR_LENGTH);
+// Output of objectiveTiers, for the machine bound at the time
+export const scoredTiers = i32s(TIER_VECTOR_LENGTH);
+
+// Movable pieces on the other boards this board's layout can draw, each packed as owner << 10 | item, and the one offered to the draw
+export const stealable = i32s(MAX_PIECES_PER_BOARD * MAX_MACHINES);
+export const offered = i32v(), offeredOwner = i32v();
+
+// The combined tier vector of the set being judged
 export const curTiers = i32s(TIER_VECTOR_LENGTH);
 export const epochTiers = i32s(TIER_VECTOR_LENGTH);
 export const bestTiers = i32s(TIER_VECTOR_LENGTH);

@@ -80,3 +80,12 @@ export const objectiveTiers = (totals: BoardTotals, plan: TierPlan, params: Scor
     }
     out[plan.tierCount] -= totals.pieces * DENSITY_TIER_WEIGHT;
 };
+
+/* A set of machines is scored on the sum of their tier vectors
+ * Tier i of every machine lands at index i, so a machine without priorities has all its stats in the top tier next to the other machines' rank-1 stats,
+ * and every machine's density term lands at the one index past the deepest machine's tiers
+ */
+export const addMachineTiers = (sum: Int32Array, tiers: Int32Array, tierCount: number, densityIndex: number) => {
+    for (let i = 0; i < tierCount; i++) sum[i] += tiers[i];
+    sum[densityIndex] += tiers[tierCount];
+};

@@ -1,6 +1,6 @@
 import tgpu, { d, type TgpuRoot } from 'typegpu';
 import { DRAW_TOURNAMENT, MAX_DRAWS } from '../draw';
-import { FRESH_START_EVERY } from '../engine';
+import { FRESH_START_EVERY, STEAL_ONE_IN } from '../engine';
 import {
     BOARD_CELLS, BOARD_H, BOARD_W, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, PLACE_LEFT_COL, PLACE_TOP_ROW, PLACE_TOUCHES_EDGE, PLACE_VALID, SCAN_STRIDES,
     SHAPE_COUNT
@@ -12,8 +12,9 @@ import { FLAG_FIXED, FLAG_PURE_NEGATIVE, FLAG_RECEIVER, FLAG_SIDE_MOUNT, FLAG_TO
 import {
     GEO_CELL_COUNT, GEO_CELLS, GEO_LENGTH, GEO_MASK_HI, GEO_MASK_LO, GEO_META, GEO_NBR_COUNT, GEO_NBRS, GEO_ORIENT_CELL_COUNT, GEO_ORIENT_CORNERS_HI,
     GEO_ORIENT_CORNERS_LO, GEO_ORIENT_COUNT, GEO_ORIENT_OFFSETS, GEO_ORIENT_START, GEO_SCAN_STRIDES,
-    NO_RECORD, Params, PoolEntry,
-    STAT_HAS_TARGET, STAT_MAXIMIZE, STAT_TARGET, STAT_TARGETED_INDEX, STAT_TIER_OF, STAT_WEIGHT, ThreadState, WORKGROUP_SIZE
+    M_DRAW_COUNT, M_DRAW_LIST_OFFSET, M_DRAW_RANK_OFFSET, M_DRAWABLE_OFFSET, M_INITIAL_BOARD_OFFSET, M_NEEDS_TOTALS, M_OPEN_CELL_COUNT, M_SHAPE_START_OFFSET,
+    M_STAT_OFFSET, M_TIER_COUNT, MACHINE_FIELDS, NO_RECORD, Params, PoolEntry,
+    STAT_HAS_TARGET, STAT_MAXIMIZE, STAT_TARGET, STAT_TARGETED_INDEX, STAT_TIER_OF, STAT_WEIGHT, threadStateOf, WORKGROUP_SIZE
 } from './layout';
 import { rngBelow, rngCoinFlip, rngCtr, rngInc } from './rng';
 import * as s from './scratch';
@@ -26,17 +27,38 @@ const RECV_STRIDE = RECV_MAX_NODES + 1;
 // The search of ../engine.ts, written to run one trajectory per GPU thread
 export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: number, threads: number, itersPerDispatch = 1) => {
     const tables = buildGpuTables(setup);
+    const machineCount = setup.machines.length;
+    const setCells = BOARD_CELLS * machineCount;
     const pool = root.createUniform(d.arrayOf(PoolEntry, tables.pool.length), tables.pool);
     const geometry = root.createReadonly(d.arrayOf(d.i32, GEO_LENGTH), Array.from(tables.geometry));
     const aux = root.createReadonly(d.arrayOf(d.i32, tables.aux.length), Array.from(tables.aux));
     const params = root.createUniform(Params, { ...tables.params, threadCount: threads, itersPerDispatch });
-    const state = root.createMutable(d.arrayOf(ThreadState, threads), buildInitialStates(setup, seed, threads));
+    const state = root.createMutable(d.arrayOf(threadStateOf(machineCount), threads), buildInitialStates(setup, seed, threads));
     const scores = root.createMutable(d.arrayOf(d.i32, threads * TIER_VECTOR_LENGTH));
-    const champion = root.createMutable(d.arrayOf(d.i32, BOARD_CELLS));
+    const champion = root.createMutable(d.arrayOf(d.i32, setCells));
+
+    const machineField = (k: number, field: number) => {
+        'use gpu';
+        return aux.$[params.$.machineOffset + k * MACHINE_FIELDS + field];
+    };
+
+    // Everything the fill and the scorer read about a machine, taken once when its board is picked
+    const bindMachine = (k: number) => {
+        'use gpu';
+        s.mOpenCellCount.$ = machineField(k, M_OPEN_CELL_COUNT);
+        s.mTierCount.$ = machineField(k, M_TIER_COUNT);
+        s.mNeedsTotals.$ = machineField(k, M_NEEDS_TOTALS);
+        s.mDrawCount.$ = machineField(k, M_DRAW_COUNT);
+        s.mDrawListOffset.$ = machineField(k, M_DRAW_LIST_OFFSET);
+        s.mShapeStartOffset.$ = machineField(k, M_SHAPE_START_OFFSET);
+        s.mDrawRankOffset.$ = machineField(k, M_DRAW_RANK_OFFSET);
+        s.mStatOffset.$ = machineField(k, M_STAT_OFFSET);
+        s.mDrawableOffset.$ = machineField(k, M_DRAWABLE_OFFSET);
+    };
 
     const statParam = (field: number, stat: number) => {
         'use gpu';
-        return aux.$[params.$.statOffset + field * 3 + stat];
+        return aux.$[s.mStatOffset.$ + field * 3 + stat];
     };
 
     const recvBonus = (slot: number, stat: number, adjNodes: number) => {
@@ -361,23 +383,41 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         return s.totE.$;
     };
 
+    // The tier vector of the board just totalled, for the machine bound now
     const objectiveTiers = () => {
         'use gpu';
-        for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.curTiers.$[i] = 0;
+        for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.scoredTiers.$[i] = 0;
         for (let stat = 0; stat < 3; stat++) {
             const ti = statParam(STAT_TIER_OF, stat);
             if (ti < 0) continue;
             const t = statTotal(stat);
             const target = statParam(STAT_TARGET, stat);
-            if (statParam(STAT_HAS_TARGET, stat) !== 0 && t < target) s.curTiers.$[ti] = s.curTiers.$[ti] - (target - t) * 10000;
-            if (statParam(STAT_MAXIMIZE, stat) !== 0) s.curTiers.$[ti] = s.curTiers.$[ti] + t * 10;
+            if (statParam(STAT_HAS_TARGET, stat) !== 0 && t < target) s.scoredTiers.$[ti] = s.scoredTiers.$[ti] - (target - t) * 10000;
+            if (statParam(STAT_MAXIMIZE, stat) !== 0) s.scoredTiers.$[ti] = s.scoredTiers.$[ti] + t * 10;
         }
-        s.curTiers.$[params.$.tierCount] = -s.totPieces.$ * DENSITY_TIER_WEIGHT;
+        s.scoredTiers.$[s.mTierCount.$] = -s.totPieces.$ * DENSITY_TIER_WEIGHT;
+    };
+
+    // The set's objective is the sum of its boards' tier vectors, the boards touched this iteration taken from their fresh scores
+    const combineTiers = () => {
+        'use gpu';
+        for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.curTiers.$[i] = 0;
+        for (let k = 0; k < params.$.machineCount; k++) {
+            const tierCount = machineField(k, M_TIER_COUNT);
+            for (let i = 0; i <= tierCount; i++) {
+                let v = s.boardTiers.$[k * TIER_VECTOR_LENGTH + i];
+                if (k === s.board.$) v = s.builtTiers.$[i];
+                else if (k === s.robbed.$) v = s.robbedTiers.$[i];
+                let at = i;
+                if (i === tierCount) at = params.$.densityIndex;
+                s.curTiers.$[at] = s.curTiers.$[at] + v;
+            }
+        }
     };
 
     const compareCurToEpoch = () => {
         'use gpu';
-        for (let i = 0; i <= params.$.tierCount; i++) {
+        for (let i = 0; i <= params.$.densityIndex; i++) {
             if (s.curTiers.$[i] < s.epochTiers.$[i]) return d.i32(-1);
             if (s.curTiers.$[i] > s.epochTiers.$[i]) return d.i32(1);
         }
@@ -386,7 +426,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
 
     const curBeatsBest = () => {
         'use gpu';
-        for (let i = 0; i <= params.$.tierCount; i++) {
+        for (let i = 0; i <= params.$.densityIndex; i++) {
             if (s.curTiers.$[i] < s.bestTiers.$[i]) return false;
             if (s.curTiers.$[i] > s.bestTiers.$[i]) return true;
         }
@@ -526,6 +566,11 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         return fixedCount;
     };
 
+    const drawableHere = (item: number) => {
+        'use gpu';
+        return aux.$[s.mDrawableOffset.$ + item] !== 0;
+    };
+
     const ruin = (isStagnant: boolean) => {
         'use gpu';
         const removableCount = s.removableCount.$;
@@ -543,14 +588,47 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
             }
         }
 
-        for (let shape = 0; shape < SHAPE_COUNT; shape++) s.shapeBlocked.$[shape] = 0;
         for (let i = removeCount; i < removableCount; i++) {
             const item = s.removable.$[i];
-            if (pool.$[item].drawable !== 0) {
+            if (drawableHere(item)) {
                 const shape = pool.$[item].shape;
                 s.shapeBlocked.$[shape] = s.shapeBlocked.$[shape] + 1;
             }
         }
+    };
+
+    /* Every module on another board of the set is out of this board's reach, and counts against its shape like a kept piece here would
+     * The movable ones this board's layout can draw are noted, since a steal may offer one after all
+     */
+    const blockOtherBoards = () => {
+        'use gpu';
+        let stealableCount = 0;
+        for (let k = 0; k < params.$.machineCount; k++) {
+            if (k === s.board.$) continue;
+            for (let i = 0; i < BOARD_CELLS; i++) {
+                const item = s.cur.$[k * BOARD_CELLS + i];
+                if (item < 0 || s.bitIsSet(item)) continue;
+                s.setBit(item);
+                if (!drawableHere(item)) continue;
+                const shape = pool.$[item].shape;
+                s.shapeBlocked.$[shape] = s.shapeBlocked.$[shape] + 1;
+                if ((pool.$[item].flags & FLAG_FIXED) !== 0) continue;
+                s.stealable.$[stealableCount] = (k << d.u32(10)) | item;
+                stealableCount = stealableCount + 1;
+            }
+        }
+        return stealableCount;
+    };
+
+    // One of the other boards' modules, chosen uniformly, joins the draw for this iteration; it moves only if the draw picks it and the fill places it
+    const offerForSteal = (offerCount: number) => {
+        'use gpu';
+        const packed = s.stealable.$[rngBelow(offerCount)];
+        s.offered.$ = packed & 1023;
+        s.offeredOwner.$ = packed >> d.u32(10);
+        s.clearBit(s.offered.$);
+        const shape = pool.$[s.offered.$].shape;
+        s.shapeBlocked.$[shape] = s.shapeBlocked.$[shape] - 1;
     };
 
     // The free cells in the scan order of ../engine.ts: from a random cell, with a random stride coprime to the board size
@@ -589,7 +667,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
             }
             placeBestFit(s.fixedItem.$[f], home);
             s.boardIsEmpty.$ = 0;
-            if (params.$.needsTotals !== 0) refreshFillTotals();
+            if (s.mNeedsTotals.$ !== 0) refreshFillTotals();
         }
     };
 
@@ -599,9 +677,9 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         for (let stat = 0; stat < 3; stat++) {
             const ti = statParam(STAT_TARGETED_INDEX, stat);
             if (ti < 0) continue;
-            let t = s.curP.$;
-            if (stat === 1) t = s.curQ.$;
-            if (stat === 2) t = s.curE.$;
+            let t = s.curP.$[s.board.$];
+            if (stat === 1) t = s.curQ.$[s.board.$];
+            if (stat === 2) t = s.curE.$[s.board.$];
             if (t >= statParam(STAT_TARGET, stat)) mask = mask | s.bit32(ti);
         }
         return mask;
@@ -609,12 +687,12 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
 
     const drawRank = (metMask: number, pos: number) => {
         'use gpu';
-        return aux.$[params.$.drawRankOffset + metMask * params.$.drawCount + pos];
+        return aux.$[s.mDrawRankOffset.$ + metMask * s.mDrawCount.$ + pos];
     };
 
     const shapeRun = (shape: number) => {
         'use gpu';
-        return aux.$[params.$.shapeStartOffset + shape + 1] - aux.$[params.$.shapeStartOffset + shape];
+        return aux.$[s.mShapeStartOffset.$ + shape + 1] - aux.$[s.mShapeStartOffset.$ + shape];
     };
 
     const shapeOffered = (shape: number, infeasible: number) => {
@@ -647,7 +725,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         for (let shape = 0; shape < SHAPE_COUNT; shape++) {
             if (!shapeOffered(shape, infeasible)) continue;
             const run = shapeRun(shape);
-            if (rest < run) return aux.$[params.$.shapeStartOffset + shape] + rest;
+            if (rest < run) return aux.$[s.mShapeStartOffset.$ + shape] + rest;
             rest = rest - run;
         }
         return -1;
@@ -658,7 +736,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         let pick = -1;
         for (let t = 0; t < DRAW_TOURNAMENT; t++) {
             const pos = drawPosition(infeasible, rngBelow(weight));
-            if (s.bitIsSet(aux.$[params.$.drawListOffset + pos])) continue;
+            if (s.bitIsSet(aux.$[s.mDrawListOffset.$ + pos])) continue;
             if (pick === -1 || drawRank(metMask, pos) > drawRank(metMask, pick)) pick = pos;
         }
         return pick;
@@ -673,15 +751,16 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
             if (weight === 0) break;
             const pos = drawTournament(infeasible, weight, metMask);
             if (pos === -1) continue;
-            const item = aux.$[params.$.drawListOffset + pos];
+            const item = aux.$[s.mDrawListOffset.$ + pos];
             const shape = pool.$[item].shape;
 
             if (placeBestFit(item, -1)) {
                 s.setBit(item);
                 s.shapeBlocked.$[shape] = s.shapeBlocked.$[shape] + 1;
                 s.boardIsEmpty.$ = 0;
-                if (params.$.needsTotals !== 0) refreshFillTotals();
+                if (s.mNeedsTotals.$ !== 0) refreshFillTotals();
                 infeasible = infeasibleShapesNow(infeasible);
+                if (item === s.offered.$) s.robbed.$ = s.offeredOwner.$;
             } else {
                 infeasible = infeasible | s.bit32(shape);
             }
@@ -689,39 +768,99 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         }
     };
 
+    // The rebuilt board is kept aside while the board a steal took from is rescored in test, without the module taken
+    const scoreBuilt = () => {
+        'use gpu';
+        boardTotals();
+        objectiveTiers();
+        s.builtP.$ = s.totP.$; s.builtQ.$ = s.totQ.$; s.builtE.$ = s.totE.$; s.builtPieces.$ = s.totPieces.$;
+        for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.builtTiers.$[i] = s.scoredTiers.$[i];
+        if (s.robbed.$ < 0) return;
+
+        for (let i = 0; i < BOARD_CELLS; i++) {
+            s.built.$[i] = s.test.$[i];
+            let cell = s.cur.$[s.robbed.$ * BOARD_CELLS + i];
+            if (cell === s.offered.$) cell = EMPTY;
+            s.test.$[i] = cell;
+        }
+        bindMachine(s.robbed.$);
+        boardTotals();
+        objectiveTiers();
+        s.robbedP.$ = s.totP.$; s.robbedQ.$ = s.totQ.$; s.robbedE.$ = s.totE.$; s.robbedPieces.$ = s.totPieces.$;
+        for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.robbedTiers.$[i] = s.scoredTiers.$[i];
+    };
+
     const acceptTest = () => {
         'use gpu';
-        for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[i] = s.test.$[i];
-        s.curP.$ = s.totP.$; s.curQ.$ = s.totQ.$; s.curE.$ = s.totE.$; s.curPieces.$ = s.totPieces.$;
+        const b = s.board.$;
+        if (s.robbed.$ < 0) {
+            for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[b * BOARD_CELLS + i] = s.test.$[i];
+        } else {
+            const r = s.robbed.$;
+            for (let i = 0; i < BOARD_CELLS; i++) {
+                s.cur.$[b * BOARD_CELLS + i] = s.built.$[i];
+                s.cur.$[r * BOARD_CELLS + i] = s.test.$[i];
+            }
+            s.curP.$[r] = s.robbedP.$; s.curQ.$[r] = s.robbedQ.$; s.curE.$[r] = s.robbedE.$; s.curPieces.$[r] = s.robbedPieces.$;
+            for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.boardTiers.$[r * TIER_VECTOR_LENGTH + i] = s.robbedTiers.$[i];
+        }
+        s.curP.$[b] = s.builtP.$; s.curQ.$[b] = s.builtQ.$; s.curE.$[b] = s.builtE.$; s.curPieces.$[b] = s.builtPieces.$;
+        for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.boardTiers.$[b * TIER_VECTOR_LENGTH + i] = s.builtTiers.$[i];
     };
 
     const recordBest = (t: number) => {
         'use gpu';
         for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.bestTiers.$[i] = s.curTiers.$[i];
         s.hasRecord.$ = 1;
-        for (let i = 0; i < BOARD_CELLS; i++) state.$[t].best[i] = s.cur.$[i];
+        for (let i = 0; i < params.$.machineCount * BOARD_CELLS; i++) state.$[t].best[i] = s.cur.$[i];
     };
 
-    // Back to the record board, and every FRESH_START_EVERY-th time to the initial board, as in ../engine.ts
+    // A board goes back to its initial state minus the modules the other boards have since taken from it, since they keep theirs
+    const freshStart = (k: number) => {
+        'use gpu';
+        const initialOffset = machineField(k, M_INITIAL_BOARD_OFFSET);
+        for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[k * BOARD_CELLS + i] = aux.$[initialOffset + i];
+        if (params.$.machineCount === 1) return;
+        s.clearBlocked();
+        for (let other = 0; other < params.$.machineCount; other++) {
+            if (other === k) continue;
+            for (let i = 0; i < BOARD_CELLS; i++) {
+                const item = s.cur.$[other * BOARD_CELLS + i];
+                if (item >= 0) s.setBit(item);
+            }
+        }
+        for (let i = 0; i < BOARD_CELLS; i++) {
+            const item = s.cur.$[k * BOARD_CELLS + i];
+            if (item >= 0 && s.bitIsSet(item)) s.cur.$[k * BOARD_CELLS + i] = EMPTY;
+        }
+    };
+
+    // Back to the record set, and every FRESH_START_EVERY-th time one board of it back to its initial state, as in ../engine.ts
     const restart = (t: number) => {
         'use gpu';
         s.hasEpoch.$ = 0;
         s.restarts.$ = s.restarts.$ + 1;
+        for (let i = 0; i < params.$.machineCount * BOARD_CELLS; i++) s.cur.$[i] = state.$[t].best[i];
         if (s.restarts.$ % FRESH_START_EVERY === 0) {
-            for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[i] = aux.$[params.$.initialBoardOffset + i];
-        } else {
-            for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[i] = state.$[t].best[i];
+            let k = 0;
+            if (params.$.machineCount > 1) k = rngBelow(params.$.machineCount);
+            freshStart(k);
         }
-        s.curPieces.$ = -1;
+        s.curPieces.$[0] = -1;
     };
 
-    // Totals of the accepted board are recomputed lazily, marked by a negative piece count, so restarts and the first iteration share one path
+    // Totals of the accepted set are recomputed lazily, marked by a negative piece count on the first board, so restarts and the first iteration share one path
     const ensureCurTotals = () => {
         'use gpu';
-        if (s.curPieces.$ >= 0) return;
-        for (let i = 0; i < BOARD_CELLS; i++) s.test.$[i] = s.cur.$[i];
-        boardTotals();
-        s.curP.$ = s.totP.$; s.curQ.$ = s.totQ.$; s.curE.$ = s.totE.$; s.curPieces.$ = s.totPieces.$;
+        if (s.curPieces.$[0] >= 0) return;
+        for (let k = 0; k < params.$.machineCount; k++) {
+            for (let i = 0; i < BOARD_CELLS; i++) s.test.$[i] = s.cur.$[k * BOARD_CELLS + i];
+            bindMachine(k);
+            boardTotals();
+            objectiveTiers();
+            s.curP.$[k] = s.totP.$; s.curQ.$[k] = s.totQ.$; s.curE.$[k] = s.totE.$; s.curPieces.$[k] = s.totPieces.$;
+            for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.boardTiers.$[k * TIER_VECTOR_LENGTH + i] = s.scoredTiers.$[i];
+        }
     };
 
     const iterate = (t: number) => {
@@ -729,21 +868,31 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         ensureCurTotals();
         const isStagnant = s.stagnation.$ >= params.$.stagnationLimit;
 
-        for (let i = 0; i < BOARD_CELLS; i++) s.test.$[i] = s.cur.$[i];
+        // A set of one machine never picks a board and never touches the random stream for it
+        s.board.$ = 0;
+        if (params.$.machineCount > 1) s.board.$ = rngBelow(params.$.machineCount);
+        bindMachine(s.board.$);
+        for (let i = 0; i < BOARD_CELLS; i++) s.test.$[i] = s.cur.$[s.board.$ * BOARD_CELLS + i];
         s.clearBlocked();
+        for (let shape = 0; shape < SHAPE_COUNT; shape++) s.shapeBlocked.$[shape] = 0;
+        s.robbed.$ = -1;
+        s.offered.$ = -1;
+        const stealableCount = blockOtherBoards();
+        if (stealableCount > 0 && !isStagnant && rngBelow(STEAL_ONE_IN) === 0) offerForSteal(stealableCount);
+
         const fixedCount = scanBoard();
         ruin(isStagnant);
         collectFreeCells();
         s.boardIsEmpty.$ = 0;
-        if (s.freeCount.$ === params.$.openCellCount) s.boardIsEmpty.$ = 1;
+        if (s.freeCount.$ === s.mOpenCellCount.$) s.boardIsEmpty.$ = 1;
 
         s.fillP.$ = 0; s.fillQ.$ = 0; s.fillE.$ = 0;
-        if (params.$.needsTotals !== 0) refreshFillTotals();
+        if (s.mNeedsTotals.$ !== 0) refreshFillTotals();
         relocateFixed(fixedCount);
         fill();
 
-        boardTotals();
-        objectiveTiers();
+        scoreBuilt();
+        combineTiers();
 
         let ordering = 1;
         if (s.hasEpoch.$ !== 0) ordering = compareCurToEpoch();
@@ -783,12 +932,15 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         s.restarts.$ = state.$[t].restarts;
         s.hasEpoch.$ = state.$[t].hasEpoch;
         s.hasRecord.$ = state.$[t].hasRecord;
-        s.curP.$ = state.$[t].curP; s.curQ.$ = state.$[t].curQ; s.curE.$ = state.$[t].curE; s.curPieces.$ = state.$[t].curPieces;
+        for (let k = 0; k < params.$.machineCount; k++) {
+            s.curP.$[k] = state.$[t].curP[k]; s.curQ.$[k] = state.$[t].curQ[k]; s.curE.$[k] = state.$[t].curE[k]; s.curPieces.$[k] = state.$[t].curPieces[k];
+        }
+        for (let i = 0; i < params.$.machineCount * TIER_VECTOR_LENGTH; i++) s.boardTiers.$[i] = state.$[t].boardTiers[i];
         for (let i = 0; i < TIER_VECTOR_LENGTH; i++) {
             s.epochTiers.$[i] = state.$[t].epochTiers[i];
             s.bestTiers.$[i] = state.$[t].bestTiers[i];
         }
-        for (let i = 0; i < BOARD_CELLS; i++) s.cur.$[i] = state.$[t].cur[i];
+        for (let i = 0; i < params.$.machineCount * BOARD_CELLS; i++) s.cur.$[i] = state.$[t].cur[i];
     };
 
     const storeState = (t: number) => {
@@ -800,12 +952,15 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         state.$[t].restarts = s.restarts.$;
         state.$[t].hasEpoch = s.hasEpoch.$;
         state.$[t].hasRecord = s.hasRecord.$;
-        state.$[t].curP = s.curP.$; state.$[t].curQ = s.curQ.$; state.$[t].curE = s.curE.$; state.$[t].curPieces = s.curPieces.$;
+        for (let k = 0; k < params.$.machineCount; k++) {
+            state.$[t].curP[k] = s.curP.$[k]; state.$[t].curQ[k] = s.curQ.$[k]; state.$[t].curE[k] = s.curE.$[k]; state.$[t].curPieces[k] = s.curPieces.$[k];
+        }
+        for (let i = 0; i < params.$.machineCount * TIER_VECTOR_LENGTH; i++) state.$[t].boardTiers[i] = s.boardTiers.$[i];
         for (let i = 0; i < TIER_VECTOR_LENGTH; i++) {
             state.$[t].epochTiers[i] = s.epochTiers.$[i];
             state.$[t].bestTiers[i] = s.bestTiers.$[i];
         }
-        for (let i = 0; i < BOARD_CELLS; i++) state.$[t].cur[i] = s.cur.$[i];
+        for (let i = 0; i < params.$.machineCount * BOARD_CELLS; i++) state.$[t].cur[i] = s.cur.$[i];
         for (let i = 0; i < TIER_VECTOR_LENGTH; i++) {
             let v = s.bestTiers.$[i];
             if (s.hasRecord.$ === 0) v = 0;
@@ -831,7 +986,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
     const extractChampion = tgpu.computeFn({ workgroupSize: [WORKGROUP_SIZE], in: { gid: d.builtin.globalInvocationId } })((input) => {
         'use gpu';
         const i = d.i32(input.gid.x);
-        if (i >= BOARD_CELLS) return;
+        if (i >= params.$.machineCount * BOARD_CELLS) return;
         champion.$[i] = state.$[params.$.championIdx].best[i];
     });
 
@@ -847,7 +1002,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
     const recordBelowThreshold = (t: number) => {
         'use gpu';
         if (state.$[t].hasRecord === 0) return true;
-        for (let i = 0; i < params.$.tierCount; i++) {
+        for (let i = 0; i < params.$.densityIndex; i++) {
             const v = state.$[t].bestTiers[i];
             if (v !== migrateBelow(i)) return v < migrateBelow(i);
         }
@@ -863,7 +1018,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         if (t >= params.$.threadCount) return;
         const c = params.$.championIdx;
         if (t === c || !recordBelowThreshold(t)) return;
-        for (let i = 0; i < BOARD_CELLS; i++) {
+        for (let i = 0; i < params.$.machineCount * BOARD_CELLS; i++) {
             const cell = state.$[c].best[i];
             state.$[t].cur[i] = cell;
             state.$[t].best[i] = cell;
@@ -871,12 +1026,12 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         for (let i = 0; i < TIER_VECTOR_LENGTH; i++) state.$[t].bestTiers[i] = state.$[c].bestTiers[i];
         state.$[t].hasRecord = 1;
         state.$[t].hasEpoch = 0;
-        state.$[t].curPieces = -1;
+        state.$[t].curPieces[0] = -1;
         state.$[t].stagnation = 0;
         state.$[t].stagnations = 0;
     });
 
-    return { tables, params, state, scores, champion, searchStep, extractChampion, migrate, runThread };
+    return { tables, params, state, scores, champion, setCells, searchStep, extractChampion, migrate, runThread };
 };
 
 export type SearchKernel = ReturnType<typeof createSearchKernel>;

@@ -4,15 +4,16 @@ import { saveToDatabase } from '../leaderboard';
 import { type Board, initializeBoard } from '../solver/board';
 import { calculateBoardStats, indexInventoryById } from '../solver/boardStats';
 import { decodeSolution, generateCodeFromState, inventoryForCode } from '../solver/codec';
-import { runSolver, type SolverHandle } from '../solver/client';
+import type { BoardUpdate } from '../solver/report';
 
+// Solves are run by the joint solve controller, which feeds this machine its record boards; isAnySolving is whether any machine is being solved
 export function useOptimizer(
     inventory: InventoryItem[],
     setInventory: React.Dispatch<React.SetStateAction<InventoryItem[]>>,
     machineId: string,
     getUsedItems: (excludeId: string) => Set<string>,
     defaultTier: GridTier = 3,
-    isExternallySolving: boolean = false
+    isAnySolving: boolean = false
 ) {
     const getSavedState = () => {
         const saved = localStorage.getItem(`optimizer_machine_${machineId}`);
@@ -64,10 +65,8 @@ export function useOptimizer(
     const [bestTotals, setBestTotals] = useState<Stats>({ Performance: 0, Quality: 0, Efficiency: 0 });
     const [bestPieceStats, setBestPieceStats] = useState<Map<string, Stats>>(new Map());
 
-    const [isSolving, setIsSolving] = useState(false);
     const [warningMsg, setWarningMsg] = useState<string | null>(null);
     const [solutionCode, setSolutionCode] = useState<string>('');
-    const solverRef = useRef<SolverHandle | null>(null);
 
     const getAvailableInventory = () => {
         if (!getUsedItems || !machineId) return inventory.filter(i => !i.isLocked);
@@ -89,10 +88,6 @@ export function useOptimizer(
     };
 
     const resetBoard = () => {
-        if (isSolving) {
-            solverRef.current?.stop();
-            setIsSolving(false);
-        }
         setBoardSync(initializeBoard(tier));
         setBestTotals({ Performance: 0, Quality: 0, Efficiency: 0 });
         setBestPieceStats(new Map());
@@ -105,9 +100,11 @@ export function useOptimizer(
         setSolutionCode('');
     };
 
-    const stopOptimization = () => {
-        solverRef.current?.stop();
-        setIsSolving(false);
+    const applyUpdate = (update: BoardUpdate) => {
+        setBoardSync(update.board);
+        setBestTotals(update.totals);
+        setBestPieceStats(update.pieceStats);
+        setSolutionCode(update.code);
     };
 
     const manuallyPlaceItem = (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => {
@@ -192,7 +189,7 @@ export function useOptimizer(
     };
 
     useEffect(() => {
-        if (!isSolving && !isExternallySolving) {
+        if (!isAnySolving) {
             const invById = indexInventoryById(inventory);
             let boardChanged = false;
             const newBoard = boardRef.current.map(row => row.map(cell => {
@@ -236,65 +233,14 @@ export function useOptimizer(
                 setSolutionCode('');
             }
         }
-    }, [inventory, tier, maximizeStats, targetStats, ignoreStats, statPriority, machineId, getUsedItems, board, isSolving, isExternallySolving]);
-
-    const runOptimization = async () => {
-        if (isSolving) {
-            solverRef.current?.stop();
-            return;
-        }
-
-        const fullInventoryForMachine = getInventoryForCode();
-        const usedByOthers = getUsedItems(machineId);
-
-        const solverPool = inventory.filter(i => !i.isLocked && !usedByOthers.has(i.id));
-
-        let boardHasMovablePieces = false;
-        boardRef.current.forEach(row => row.forEach(cell => {
-            if (cell && cell !== 'Locked') boardHasMovablePieces = true;
-        }));
-
-        if (solverPool.length === 0 && !boardHasMovablePieces) {
-            setWarningMsg(`Cannot optimize: No unused modules available.`);
-            return;
-        }
-
-        const engineInventory = inventory.map(item =>
-            usedByOthers.has(item.id) ? { ...item, isLocked: true } : item
-        );
-
-        setSolutionCode('');
-        setWarningMsg(null);
-        setIsSolving(true);
-
-        const machine = { id: machineId, tier, targetStats, maximizeStats, ignoreStats, statPriority };
-
-        const solver = runSolver(
-            { machine, initialBoard: boardRef.current, searchPoolInventory: engineInventory, fullInventory: fullInventoryForMachine },
-            (update) => {
-                setBoardSync(update.board);
-                setBestTotals(update.totals);
-                setBestPieceStats(update.pieceStats);
-                setSolutionCode(update.code);
-            }
-        );
-        solverRef.current = solver;
-        try {
-            await solver.done;
-        } catch (error) {
-            console.error(error);
-            setWarningMsg('The optimizer stopped unexpectedly.');
-        }
-
-        setIsSolving(false);
-    };
+    }, [inventory, tier, maximizeStats, targetStats, ignoreStats, statPriority, machineId, getUsedItems, board, isAnySolving]);
 
     return {
         tier, setTier, handleTierChange, targetStats, setTargetStats,
         maximizeStats, setMaximizeStats, ignoreStats, setIgnoreStats,
         statPriority, setStatPriority, board, bestTotals, bestPieceStats,
-        isSolving, stopOptimization, warningMsg, setWarningMsg,
-        solutionCode, setSolutionCode, importSolution, runOptimization, resetBoard,
+        warningMsg, setWarningMsg, applyUpdate,
+        solutionCode, setSolutionCode, importSolution, resetBoard,
         manuallyPlaceItem, manuallyRemoveItem, isValidPlacement, boardRef
     };
 }

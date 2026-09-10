@@ -6,24 +6,29 @@ import {
     placeEntry, SCAN_STRIDES, SHAPE_COUNT, shapeFitsFree
 } from './geometry';
 import { EMPTY } from './indexBoard';
-import { compareTiers, objectiveTiers, TIER_VECTOR_LENGTH } from './objective';
+import { addMachineTiers, compareTiers, objectiveTiers, TIER_VECTOR_LENGTH } from './objective';
 import { MAX_PIECES_PER_BOARD } from './pool';
 import { buildUpdate, type SolveUpdate } from './report';
 import { randomSeed, type Rng, rngBelow, rngCoinFlip, seedRng } from './rng';
-import { prepareSolve, type SolveRequest } from './setup';
+import { boardOfSet, prepareSolve, type SolveRequest } from './setup';
 import { FLAG_FIXED } from './tables';
 import { createYielder, FRAME_BUDGET_MS, now, TIMER_YIELD_INTERVAL_MS } from './yielder';
 
-// A coordinated multi-machine mode (shared pool consumption, a balance penalty across machines, rebuild-all on stagnation)
-// existed at commit e5c614c. The UI only ever ran one machine per engine, so it was removed
-// Run All is N independent single-machine solves
-
 // How many perturbations in a row the search rides out without a new record before it goes back to the record board
 export const RESTART_AFTER_STAGNATIONS = 8;
-// Every so many restarts the search starts over from the initial board instead, so it does not spend all its time around one record
+/* Every so many restarts the search puts one board back to its initial state instead, so it does not spend all its time around one record
+ * In a set that also hands the board's modules back to the pool for the other boards to pick up, which is a redistribution no single move makes
+ */
 export const FRESH_START_EVERY = 4;
 
 export const STAGNATION_LIMIT = 150;
+
+/* One iteration in so many offers a module off another board of the set to the draw, chosen uniformly among the ones this board could use
+ * If the draw picks it and the fill places it, it is lifted from its owner, so the step is judged on what this board gains against what that board loses
+ * Rebuilding one board at a time never moves a module otherwise: the owner would have to drop it and this board pick it up in the same accepted step
+ * Offering every foreign module at once let the best-ranked ones win almost every steal iteration, and those swaps were nearly always rejected
+ */
+export const STEAL_ONE_IN = 4;
 
 // Unbiased Fisher-Yates over the first `count` entries
 // `sort(() => Math.random() - 0.5)` is not a shuffle: it leaves the ordering strongly correlated with the input, which narrows the range of layouts the solver actually explores
@@ -60,20 +65,59 @@ export const runOptimizationEngine = async (
     const rng = seedRng(request.seed ?? randomSeed(), request.thread ?? 0);
 
     const setup = prepareSolve(request);
-    const { tables, draw, plan, tierLength, params, targeted, drawRanks, needsTotals, initialIndexBoard, openCellCount } = setup;
-    const { drawList, shapeStart, drawable } = draw;
+    const { tables, tierLength, densityIndex, initialSet, machines } = setup;
+    const machineCount = machines.length;
+    // An iteration rebuilds one board, so a set gets as many tries per board before the big ruin as one board alone would
+    const stagnationLimit = STAGNATION_LIMIT * machineCount;
 
-    const currentBoard = new Int32Array(initialIndexBoard);
+    /* Each iteration rebuilds one board of the set, so what the fill reads about its machine is rebound when the board is picked
+     * A set of one machine never picks and never touches the random stream for it
+     */
+    let { draw, plan, params, targeted, drawRanks, needsTotals, openCellCount } = machines[0];
+    let { drawList, shapeStart, drawable } = draw;
+    const bindMachine = (k: number) => {
+        ({ draw, plan, params, targeted, drawRanks, needsTotals, openCellCount } = machines[k]);
+        ({ drawList, shapeStart, drawable } = draw);
+    };
+
+    // The boards of the set laid end to end, worked on through one view per board
+    const currentSet = new Int32Array(initialSet);
     // Reused across iterations so the search does not allocate a fresh board per attempt
-    const testBoard = new Int32Array(initialIndexBoard);
-    // The best board ever seen, which is what gets reported
-    // Once the search can restart, the board it is working on is no longer guaranteed to be the best one found,
+    const testSet = new Int32Array(initialSet);
+    // The best set ever seen, which is what gets reported
+    // Once the search can restart, the set it is working on is no longer guaranteed to be the best one found,
     // so the record is kept separately. A restart must never be able to lose a result that has already been shown
-    const bestBoard = new Int32Array(initialIndexBoard);
+    const bestSet = new Int32Array(initialSet);
+    const currentViews = machines.map((_, k) => boardOfSet(currentSet, k));
+    const testViews = machines.map((_, k) => boardOfSet(testSet, k));
+    let testBoard = testViews[0];
 
-    const currentTotals: BoardTotals = { p: 0, q: 0, e: 0, pieces: 0 };
+    // The accepted totals and tier vector of every board, so only the rebuilt board is rescored per iteration
+    const currentTotals = machines.map((): BoardTotals => ({ p: 0, q: 0, e: 0, pieces: 0 }));
+    const boardTiers = machines.map(() => new Int32Array(TIER_VECTOR_LENGTH));
     const fillTotals: BoardTotals = { p: 0, q: 0, e: 0, pieces: 0 };
-    boardTotals(tables, currentBoard, currentTotals);
+    const fillTiers = new Int32Array(TIER_VECTOR_LENGTH);
+    const rescoreCurrent = () => {
+        for (let k = 0; k < machineCount; k++) {
+            boardTotals(tables, currentViews[k], currentTotals[k]);
+            objectiveTiers(currentTotals[k], machines[k].plan, machines[k].params, boardTiers[k]);
+        }
+    };
+    rescoreCurrent();
+
+    // The board a steal took a module from this iteration, rescored alongside the rebuilt board
+    let robbed = -1;
+    const robbedTotals: BoardTotals = { p: 0, q: 0, e: 0, pieces: 0 };
+    const robbedTiers = new Int32Array(TIER_VECTOR_LENGTH);
+
+    // The set's objective is the sum of its boards' tier vectors
+    const combineTiers = (rebuilt: number, out: Int32Array) => {
+        out.fill(0);
+        for (let k = 0; k < machineCount; k++) {
+            const tiers = k === rebuilt ? fillTiers : k === robbed ? robbedTiers : boardTiers[k];
+            addMachineTiers(out, tiers, machines[k].plan.tierCount, densityIndex);
+        }
+    };
 
     const currentTiers = new Int32Array(TIER_VECTOR_LENGTH);
     // epochTiers is the best this attempt has reached, bestTiers the best ever reached
@@ -92,6 +136,9 @@ export const runOptimizationEngine = async (
     const blocked = new Uint32Array((tables.count + 31) >>> 5);
     // Movable pieces on the board, in the order they are first met
     const removable = new Int32Array(MAX_PIECES_PER_BOARD);
+    // Movable pieces on the other boards that this board's layout can draw, with the board each one stands on
+    const stealable = new Int32Array(MAX_PIECES_PER_BOARD * machineCount);
+    const stealableOwner = new Int8Array(MAX_PIECES_PER_BOARD * machineCount);
     // Every special or locked piece sitting on the rebuilt board, with the cells it is currently standing on
     // They stay put until the fill lifts them one at a time, so the board is never in a state where one is missing
     const fixedItem = new Int32Array(MAX_PIECES_PER_BOARD);
@@ -235,11 +282,62 @@ export const runOptimizationEngine = async (
         return -1;
     };
 
+    // Every module on another board of the set is out of this board's reach, and counts against its shape like a kept piece here would
+    // The movable ones this board's layout can draw are noted, since a steal may offer them after all
+    const blockOtherBoards = (board: number) => {
+        let stealableCount = 0;
+        for (let k = 0; k < machineCount; k++) {
+            if (k === board) continue;
+            const other = testViews[k];
+            for (let i = 0; i < BOARD_CELLS; i++) {
+                const item = other[i];
+                if (item < 0 || bitIsSet(blocked, item)) continue;
+                setBit(blocked, item);
+                if (drawable[item] === 0) continue;
+                shapeBlocked[tables.shape[item]]++;
+                if ((tables.flags[item] & FLAG_FIXED) !== 0) continue;
+                stealable[stealableCount] = item;
+                stealableOwner[stealableCount++] = k;
+            }
+        }
+        return stealableCount;
+    };
+
+    // One of the other boards' modules, chosen uniformly, joins the draw for this iteration; it moves only if the draw picks it and the fill places it
+    let offered = -1;
+    let offeredOwner = -1;
+    const offerForSteal = (offerCount: number) => {
+        const s = rngBelow(rng, offerCount);
+        offered = stealable[s];
+        offeredOwner = stealableOwner[s];
+        clearBit(blocked, offered);
+        shapeBlocked[tables.shape[offered]]--;
+    };
+
+    const takeFromOwner = () => {
+        robbed = offeredOwner;
+        const source = testViews[robbed];
+        for (let i = 0; i < BOARD_CELLS; i++) if (source[i] === offered) source[i] = EMPTY;
+    };
+
+    // A board goes back to its initial state minus the modules the other boards have since taken from it, since they keep theirs
+    const freshStart = (k: number) => {
+        const view = currentViews[k];
+        view.set(boardOfSet(initialSet, k));
+        if (machineCount === 1) return;
+        blocked.fill(0);
+        for (let other = 0; other < machineCount; other++) {
+            if (other === k) continue;
+            for (let i = 0; i < BOARD_CELLS; i++) if (currentViews[other][i] >= 0) setBit(blocked, currentViews[other][i]);
+        }
+        for (let i = 0; i < BOARD_CELLS; i++) if (view[i] >= 0 && bitIsSet(blocked, view[i])) view[i] = EMPTY;
+    };
+
     let pendingUpdate = false;
     const flushUpdate = () => {
         if (!pendingUpdate) return;
         pendingUpdate = false;
-        onUpdate(buildUpdate(request, setup, bestBoard, bestTiers));
+        onUpdate(buildUpdate(request, setup, bestSet, bestTiers));
     };
 
     const { portYield, timerYield, dispose } = createYielder();
@@ -250,10 +348,23 @@ export const runOptimizationEngine = async (
     try {
         while (control.running && iterations < maxIterations) {
             iterations++;
-            const isStagnant = stagnationCounter >= STAGNATION_LIMIT;
+            const isStagnant = stagnationCounter >= stagnationLimit;
 
-            testBoard.set(currentBoard);
+            let board = 0;
+            if (machineCount > 1) {
+                board = rngBelow(rng, machineCount);
+                bindMachine(board);
+                testBoard = testViews[board];
+            }
+
+            testSet.set(currentSet);
             blocked.fill(0);
+            shapeBlocked.fill(0);
+            robbed = -1;
+
+            const stealableCount = blockOtherBoards(board);
+            offered = -1;
+            if (stealableCount > 0 && !isStagnant && rngBelow(rng, STEAL_ONE_IN) === 0) offerForSteal(stealableCount);
 
             let removableCount = 0;
             let fixedCount = 0;
@@ -299,7 +410,6 @@ export const runOptimizationEngine = async (
                 }
             }
 
-            shapeBlocked.fill(0);
             for (let i = removeCount; i < removableCount; i++) {
                 const item = removable[i];
                 if (drawable[item] !== 0) shapeBlocked[tables.shape[item]]++;
@@ -353,7 +463,8 @@ export const runOptimizationEngine = async (
             let metMask = 0;
             for (let i = 0; i < targeted.length; i++) {
                 const s = targeted[i];
-                const t = s === 0 ? currentTotals.p : s === 1 ? currentTotals.q : currentTotals.e;
+                const accepted = currentTotals[board];
+                const t = s === 0 ? accepted.p : s === 1 ? accepted.q : accepted.e;
                 if (t >= params.target[s]) metMask |= 1 << i;
             }
             const ranks = drawRanks[metMask];
@@ -374,12 +485,18 @@ export const runOptimizationEngine = async (
                     boardIsEmpty = false;
                     if (needsTotals) boardTotals(tables, testBoard, fillTotals);
                     infeasibleShapes = infeasibleShapesNow(infeasibleShapes);
+                    if (item === offered) takeFromOwner();
                 }
                 weight = drawWeight(infeasibleShapes);
             }
 
             boardTotals(tables, testBoard, fillTotals);
-            objectiveTiers(fillTotals, plan, params, currentTiers);
+            objectiveTiers(fillTotals, plan, params, fillTiers);
+            if (robbed !== -1) {
+                boardTotals(tables, testViews[robbed], robbedTotals);
+                objectiveTiers(robbedTotals, machines[robbed].plan, machines[robbed].params, robbedTiers);
+            }
+            combineTiers(board, currentTiers);
 
             if (!control.running) break;
 
@@ -397,8 +514,13 @@ export const runOptimizationEngine = async (
                     epochTiers.set(currentTiers);
                     hasEpoch = true;
                 }
-                currentBoard.set(testBoard);
-                copyTotals(fillTotals, currentTotals);
+                currentSet.set(testSet);
+                copyTotals(fillTotals, currentTotals[board]);
+                boardTiers[board].set(fillTiers);
+                if (robbed !== -1) {
+                    copyTotals(robbedTotals, currentTotals[robbed]);
+                    boardTiers[robbed].set(robbedTiers);
+                }
 
                 // Any step up from the epoch's best is progress worth riding out; a new record is additionally the only thing worth reporting
                 if (improved) {
@@ -406,7 +528,7 @@ export const runOptimizationEngine = async (
                     if (!hasRecord || compareTiers(currentTiers, bestTiers, tierLength) > 0) {
                         bestTiers.set(currentTiers);
                         hasRecord = true;
-                        bestBoard.set(currentBoard);
+                        bestSet.set(currentSet);
                         pendingUpdate = true;
                     }
                 } else {
@@ -423,8 +545,9 @@ export const runOptimizationEngine = async (
                 if (++stagnationRuns >= RESTART_AFTER_STAGNATIONS) {
                     stagnationRuns = 0;
                     hasEpoch = false;
-                    currentBoard.set(++restarts % FRESH_START_EVERY === 0 ? initialIndexBoard : bestBoard);
-                    boardTotals(tables, currentBoard, currentTotals);
+                    currentSet.set(bestSet);
+                    if (++restarts % FRESH_START_EVERY === 0) freshStart(machineCount > 1 ? rngBelow(rng, machineCount) : 0);
+                    rescoreCurrent();
                 }
             }
 

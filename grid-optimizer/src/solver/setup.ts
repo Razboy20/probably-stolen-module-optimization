@@ -3,15 +3,23 @@ import type { Board } from './board';
 import { indexInventoryById } from './boardStats';
 import { buildDrawRanks, type DrawLayout, layoutDraw, targetedStats } from './draw';
 import { BOARD_CELLS } from './geometry';
-import { type IndexBoard, LOCKED, toIndexBoard } from './indexBoard';
+import { toIndexBoard } from './indexBoard';
 import { buildTierPlan, type MachineConfig, STAT_KEYS, statIsIgnored, tierBoost, type TierPlan } from './objective';
 import { buildSearchPool } from './pool';
-import { buildScoringParams, type ScoringParams } from './scoring';
+import { buildScoringParams, MAX_TARGET, type ScoringParams } from './scoring';
 import { buildPoolTables, type PoolTables } from './tables';
 
-export interface SolveRequest {
+export interface MachineRequest {
     machine: MachineConfig;
     initialBoard: Board;
+}
+
+/* One solve over a set of machines that share the inventory: the search moves modules within and between their boards
+ * and is judged on the sum of their objectives. A single machine is the ordinary case
+ * Modules already on one of these boards must not be marked locked in the search pool, or no board could ever draw them
+ */
+export interface SolveRequest {
+    machines: MachineRequest[];
     searchPoolInventory: InventoryItem[];
     fullInventory: InventoryItem[];
     seed?: number;
@@ -20,30 +28,39 @@ export interface SolveRequest {
     maxIterations?: number;
 }
 
-// Everything about one solve that is fixed before the first iteration, shared by every backend
-export interface SolveSetup {
-    tables: PoolTables;
-    inventoryById: Map<string, InventoryItem>;
+// What is fixed before the first iteration for one machine of the set
+export interface MachineSetup {
+    machine: MachineConfig;
     draw: DrawLayout;
     plan: TierPlan;
-    tierLength: number;
     params: ScoringParams;
     targeted: number[];
     drawRanks: Int32Array[];
     needsTotals: boolean;
-    initialIndexBoard: IndexBoard;
     openCellCount: number;
 }
 
-export const prepareSolve = (request: SolveRequest): SolveSetup => {
-    const { machine, initialBoard, searchPoolInventory, fullInventory } = request;
-    const tables = buildPoolTables(fullInventory, initialBoard);
-    const inventoryById = indexInventoryById(fullInventory);
+// Everything about one solve that is fixed before the first iteration, shared by every backend
+export interface SolveSetup {
+    tables: PoolTables;
+    inventoryById: Map<string, InventoryItem>;
+    machines: MachineSetup[];
+    // The combined tier vector: every machine's tiers left-aligned, and every density term at densityIndex
+    densityIndex: number;
+    tierLength: number;
+    // The boards of the set laid end to end, BOARD_CELLS per machine
+    initialSet: Int32Array;
+}
 
+export const boardOfSet = (set: Int32Array, machine: number) => set.subarray(machine * BOARD_CELLS, (machine + 1) * BOARD_CELLS);
+
+// A shortfall costs 10000 per point per stat, and the sum over the set has to stay within 32 bits
+const targetCap = (machineCount: number) => Math.min(MAX_TARGET, Math.floor(2 ** 31 / (10000 * 3 * machineCount)));
+
+const prepareMachine = (tables: PoolTables, searchPoolInventory: InventoryItem[], { machine, initialBoard }: MachineRequest, cap: number): MachineSetup => {
     // Boards may already hold modules the search itself would not pick up, so the pruned pool is only used for choosing what to place
     const searchPool = buildSearchPool(searchPoolInventory, tables.internal, machine).filter(item => tables.indexOf.has(item.id));
     const draw = layoutDraw(tables, Int32Array.from(searchPool, item => tables.indexOf.get(item.id)!));
-    const { drawList } = draw;
 
     const plan = buildTierPlan(machine);
 
@@ -57,21 +74,32 @@ export const prepareSolve = (request: SolveRequest): SolveSetup => {
         if (machine.targetStats[key] !== null) w += 15;
         placementWeights[key] = w * tierBoost(plan, s);
     }
-    const params = buildScoringParams(machine, placementWeights);
+    const params = buildScoringParams(machine, placementWeights, cap);
     const targeted = targetedStats(machine);
-    const drawRanks = buildDrawRanks(tables, drawList, machine, plan);
+    const drawRanks = buildDrawRanks(tables, draw.drawList, machine, plan);
 
     // The placement heuristic only reads the running totals to judge distance to a target,
     // so without one the recalculation after every placement is pure waste
     const needsTotals = targeted.some(s => !statIsIgnored(machine, STAT_KEYS[s]));
 
-    const initialIndexBoard = toIndexBoard(initialBoard, tables.indexOf);
     // A board is empty exactly when every cell it has is free, and which cells it has is fixed by its tier
     let openCellCount = 0;
-    for (let i = 0; i < BOARD_CELLS; i++) if (initialIndexBoard[i] !== LOCKED) openCellCount++;
+    for (const row of initialBoard) for (const cell of row) if (cell !== 'Locked') openCellCount++;
 
-    return {
-        tables, inventoryById, draw, plan, tierLength: plan.tierCount + 1, params, targeted, drawRanks,
-        needsTotals, initialIndexBoard, openCellCount
-    };
+    return { machine, draw, plan, params, targeted, drawRanks, needsTotals, openCellCount };
+};
+
+export const prepareSolve = (request: SolveRequest): SolveSetup => {
+    const { machines, searchPoolInventory, fullInventory } = request;
+    const tables = buildPoolTables(fullInventory, machines.map(m => m.initialBoard));
+    const inventoryById = indexInventoryById(fullInventory);
+
+    const cap = targetCap(machines.length);
+    const machineSetups = machines.map(m => prepareMachine(tables, searchPoolInventory, m, cap));
+    const densityIndex = Math.max(...machineSetups.map(m => m.plan.tierCount));
+
+    const initialSet = new Int32Array(BOARD_CELLS * machines.length);
+    machines.forEach((m, k) => boardOfSet(initialSet, k).set(toIndexBoard(m.initialBoard, tables.indexOf)));
+
+    return { tables, inventoryById, machines: machineSetups, densityIndex, tierLength: densityIndex + 1, initialSet };
 };

@@ -46,22 +46,24 @@ export interface PoolTables {
 export const recvBonus = (tables: PoolTables, slot: number, stat: number, adjNodes: number) =>
     tables.recvTable[(slot * 3 + stat) * RECV_STRIDE + adjNodes];
 
-const collectItems = (inventory: InventoryItem[], board: Board) => {
+const collectItems = (inventory: InventoryItem[], boards: Board[]) => {
     const items = [...inventory];
     const seen = new Set(items.map(item => item.id));
-    for (const row of board) {
-        for (const cell of row) {
-            if (cell && cell !== 'Locked' && !seen.has(cell.id)) {
-                seen.add(cell.id);
-                items.push(cell);
+    for (const board of boards) {
+        for (const row of board) {
+            for (const cell of row) {
+                if (cell && cell !== 'Locked' && !seen.has(cell.id)) {
+                    seen.add(cell.id);
+                    items.push(cell);
+                }
             }
         }
     }
     return items;
 };
 
-export const buildPoolTables = (inventory: InventoryItem[], board: Board): PoolTables => {
-    const items = collectItems(inventory, board);
+export const buildPoolTables = (inventory: InventoryItem[], boards: Board[]): PoolTables => {
+    const items = collectItems(inventory, boards);
     const count = items.length;
     const indexOf = new Map<string, number>();
     const internal = new Map<string, Stats>();

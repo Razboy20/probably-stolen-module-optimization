@@ -11,22 +11,24 @@ const MS = Number(query.get('ms') ?? 3000);
 const TARGETS = Number(query.get('targets') ?? 0);
 const IMPL = (query.get('impl') ?? 'gpu') as SolverBackend;
 const PARALLELISM = query.get('threads') ? Number(query.get('threads')) : undefined;
+const MACHINES = Number(query.get('machines') ?? 1);
 
 const out = document.getElementById('out') as HTMLPreElement;
 const log = (line: string) => { out.textContent += line + '\n'; };
 
 const run = async () => {
-    const { machine, board, inv } = buildBenchCase(SEED, N, TARGETS);
+    const { machines, inv } = buildBenchCase(SEED, N, TARGETS, MACHINES);
     let latest = null as SolveUpdate | null;
-    const checkpoints: Record<string, Stats | null> = {};
+    const totalsOf = (u: SolveUpdate) => u.boards.map(b => b.totals);
+    const checkpoints: Record<string, Stats[] | null> = {};
     for (const ms of [250, 1000, 3000, 10000]) {
-        if (ms <= MS) setTimeout(() => { checkpoints[ms] = latest?.totals ?? null; }, ms);
+        if (ms <= MS) setTimeout(() => { checkpoints[ms] = latest ? totalsOf(latest) : null; }, ms);
     }
 
     const t0 = performance.now();
     const solver = runSolver(
-        { machine, initialBoard: board, searchPoolInventory: inv, fullInventory: inv, seed: SEED },
-        u => { latest = u; log(`${Math.round(performance.now() - t0)} ms  tiers=${JSON.stringify(u.tiers)}  totals=${JSON.stringify(u.totals)}`); },
+        { machines: machines.map(({ machine, board }) => ({ machine, initialBoard: board })), searchPoolInventory: inv, fullInventory: inv, seed: SEED },
+        u => { latest = u; log(`${Math.round(performance.now() - t0)} ms  tiers=${JSON.stringify(u.tiers)}  totals=${JSON.stringify(totalsOf(u))}`); },
         IMPL,
         PARALLELISM
     );
@@ -34,8 +36,8 @@ const run = async () => {
     const { iterations } = await solver.done;
     const dt = performance.now() - t0;
     log(JSON.stringify({
-        seed: SEED, N, targets: TARGETS, impl: IMPL, threads: PARALLELISM, ms: Math.round(dt), iterations,
-        itersPerSec: Math.round(iterations / (dt / 1000)), totals: latest?.totals, checkpoints
+        seed: SEED, N, targets: TARGETS, machines: MACHINES, impl: IMPL, threads: PARALLELISM, ms: Math.round(dt), iterations,
+        itersPerSec: Math.round(iterations / (dt / 1000)), tiers: latest?.tiers, totals: latest ? totalsOf(latest) : null, checkpoints
     }, null, 2));
 };
 

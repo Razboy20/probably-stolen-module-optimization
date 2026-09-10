@@ -26,18 +26,18 @@ const T_END = Number(process.env.T1 ?? 0.5);
 // Milliseconds of the solver to run first, so the annealing starts from the solver's plateau and shows whether anything better lies near it
 const FROM_SOLVER_MS = Number(process.env.FROM_SOLVER_MS ?? 0);
 
-const { machine, board, inv } = buildBenchCase(SEED, N, TARGETS);
-const request = { machine, initialBoard: board, searchPoolInventory: inv, fullInventory: inv, seed: SEED };
-const { tables, draw, plan, params, tierLength, initialIndexBoard } = prepareSolve(request);
+const { machines: [{ machine, board }], inv } = buildBenchCase(SEED, N, TARGETS);
+const request = { machines: [{ machine, initialBoard: board }], searchPoolInventory: inv, fullInventory: inv, seed: SEED };
+const { tables, tierLength, initialSet, machines: [{ draw, plan, params }] } = prepareSolve(request);
 const rng: Rng = seedRng(SEED, 99);
 
-const startBoard = new Int32Array(initialIndexBoard);
+const startBoard = new Int32Array(initialSet);
 if (FROM_SOLVER_MS > 0) {
     let latest = null as SolveUpdate | null;
     const solver = runSolver(request, u => { latest = u; }, 'inline');
     setTimeout(() => solver.stop(), FROM_SOLVER_MS);
     await solver.done;
-    if (latest) startBoard.set(toIndexBoard(latest.board, tables.indexOf));
+    if (latest) startBoard.set(toIndexBoard(latest.boards[0].board, tables.indexOf));
 }
 
 const current = new Int32Array(startBoard);

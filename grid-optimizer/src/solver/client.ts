@@ -107,10 +107,8 @@ const withFallback = (primary: SolverHandle, makeFallback: () => SolverHandle): 
 const workersAvailable = () => typeof Worker !== 'undefined';
 const coreCount = () => (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
 
-// The first solve running takes the GPU or every spare core; solves started while it runs (Run All) get one worker each
-let activeSolves = 0;
+// One solve runs at a time and takes the GPU or every spare core; a solve started while the GPU is still held lands on the cores
 let gpuLeased = false;
-const populationSize = (requested?: number) => requested ?? (activeSolves === 0 ? Math.max(1, coreCount() - 1) : 1);
 
 const resolveBackend = (preference: SolverBackend): Exclude<SolverBackend, 'auto'> => {
     if (preference === 'inline') return 'inline';
@@ -120,24 +118,19 @@ const resolveBackend = (preference: SolverBackend): Exclude<SolverBackend, 'auto
     return preference === 'auto' ? 'population' : preference;
 };
 
-const track = (handle: SolverHandle): SolverHandle => {
-    activeSolves++;
-    handle.done.finally(() => { activeSolves--; });
-    return handle;
-};
-
 const runOnCpu = (request: SolveRequest, onUpdate: UpdateHandler, backend: 'population' | 'workers', workers?: number): SolverHandle => {
     if (!workersAvailable()) return runInline(request, onUpdate);
-    const size = backend === 'population' ? populationSize(workers) : 1;
+    const size = backend === 'population' ? workers ?? Math.max(1, coreCount() - 1) : 1;
     return size > 1 ? runPopulation(request, onUpdate, size) : runInWorker(request, onUpdate);
 };
 
+// The lease is released on the promise the caller awaits, so a solve started right after this one settles can take the GPU again
 const runOnGpu = (request: SolveRequest, onUpdate: UpdateHandler, parallelism?: number): SolverHandle => {
     gpuLeased = true;
     const gate = recordGate(onUpdate);
     const gpu = runGpuPopulation(request, gate, parallelism);
-    gpu.done.catch(markGpuFailed).finally(() => { gpuLeased = false; });
-    return withFallback(gpu, () => runOnCpu(request, gate, 'population'));
+    const done = gpu.done.catch(error => { markGpuFailed(); throw error; }).finally(() => { gpuLeased = false; });
+    return withFallback({ stop: gpu.stop, done }, () => runOnCpu(request, gate, 'population'));
 };
 
 // parallelism overrides the worker count or GPU thread count, for benchmarks
@@ -145,13 +138,13 @@ export const runSolver = (
     request: SolveRequest, onUpdate: UpdateHandler, preference = readBackendPreference(), parallelism?: number
 ): SolverHandle => {
     const backend = resolveBackend(preference);
-    if (backend === 'gpu') return track(runOnGpu(request, onUpdate, parallelism));
+    if (backend === 'gpu') return runOnGpu(request, onUpdate, parallelism);
     if (backend !== 'inline') {
         try {
-            return track(runOnCpu(request, onUpdate, backend, parallelism));
+            return runOnCpu(request, onUpdate, backend, parallelism);
         } catch (error) {
             console.warn('Solver worker unavailable, running on the main thread', error);
         }
     }
-    return track(runInline(request, onUpdate));
+    return runInline(request, onUpdate);
 };

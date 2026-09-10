@@ -76,7 +76,7 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
     const solve = async () => {
         const root = await acquireRoot();
         const setup = prepareSolve(request);
-        if (!fitsGpu(setup)) throw new Error('Solve does not fit the GPU tables');
+        if (!fitsGpu(setup)) throw new Error(`Solve does not fit the GPU tables: ${setup.machines.length} machines, ${setup.tables.count} modules`);
         const seed = request.seed ?? randomSeed();
         const kernel: SearchKernel = createSearchKernel(root, setup, seed, threads);
         const params = { ...kernel.tables.params, threadCount: threads, itersPerDispatch: 1 };
@@ -128,7 +128,7 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
             bestTiers = tiers;
 
             kernel.params.write(params);
-            extract.dispatchWorkgroups(1);
+            extract.dispatchWorkgroups(Math.ceil(kernel.setCells / WORKGROUP_SIZE));
             const board = Int32Array.from(await kernel.champion.read());
             onUpdate(buildUpdate(request, setup, board, tiers));
         }
