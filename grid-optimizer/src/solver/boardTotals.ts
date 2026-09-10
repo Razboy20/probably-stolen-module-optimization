@@ -18,6 +18,8 @@ const pieceMinY = new Int32Array(MAX_PIECES_PER_BOARD);
 const pieceCellCount = new Int32Array(MAX_PIECES_PER_BOARD);
 const pieceCells = new Int32Array(MAX_PIECES_PER_BOARD * MAX_PIECE_CELLS);
 const pieceAdjNodes = new Int32Array(MAX_PIECES_PER_BOARD);
+// The slot of the piece standing on each occupied cell, so a neighbour's piece is one lookup away
+const cellSlot = new Int32Array(BOARD_CELLS);
 const seen = new Int32Array(MAX_PIECE_NEIGHBORS);
 
 const slotOfItem = (count: number, item: number) => {
@@ -35,7 +37,10 @@ export const boardTotals = (tables: PoolTables, board: IndexBoard, out: BoardTot
         if (item < 0) continue;
         const x = i % BOARD_W;
         const y = (i - x) / BOARD_W;
-        let s = slotOfItem(count, item);
+        // A piece is connected, so most of its cells have the cell to their left or above them in the same piece
+        let s = x > 0 && board[i - 1] === item ? cellSlot[i - 1]
+            : y > 0 && board[i - BOARD_W] === item ? cellSlot[i - BOARD_W]
+            : slotOfItem(count, item);
         if (s === -1) {
             s = count++;
             pieceItem[s] = item;
@@ -48,6 +53,7 @@ export const boardTotals = (tables: PoolTables, board: IndexBoard, out: BoardTot
             if (y < pieceMinY[s]) pieceMinY[s] = y;
         }
         pieceCells[s * MAX_PIECE_CELLS + pieceCellCount[s]++] = i;
+        cellSlot[i] = s;
     }
 
     let totalP = 0, totalQ = 0, totalE = 0;
@@ -66,7 +72,8 @@ export const boardTotals = (tables: PoolTables, board: IndexBoard, out: BoardTot
                 const nx = x + NEIGHBOR_DX[d];
                 const ny = y + NEIGHBOR_DY[d];
                 if (nx < 0 || nx >= BOARD_W || ny < 0 || ny >= BOARD_H) continue;
-                const adj = board[ny * BOARD_W + nx];
+                const adjCell = ny * BOARD_W + nx;
+                const adj = board[adjCell];
                 if (adj < 0 || (tables.flags[adj] & FLAG_WHITE) !== 0) continue;
 
                 let dup = false;
@@ -74,7 +81,7 @@ export const boardTotals = (tables: PoolTables, board: IndexBoard, out: BoardTot
                 if (dup) continue;
                 seen[seenCount++] = adj;
 
-                pieceAdjNodes[slotOfItem(count, adj)]++;
+                pieceAdjNodes[cellSlot[adjCell]]++;
                 nodeP += tables.p[adj];
                 nodeQ += tables.q[adj];
                 nodeE += tables.e[adj];

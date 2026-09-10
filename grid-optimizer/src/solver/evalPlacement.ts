@@ -1,9 +1,8 @@
 import type { IndexBoard } from './indexBoard';
 import {
-    MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, PLACE_CELL_COUNT, PLACE_CELLS, PLACE_LEFT_COL, PLACE_META, PLACE_NBR_COUNT, PLACE_NBRS,
+    MAX_PIECE_NEIGHBORS, PLACE_LEFT_COL, PLACE_MASK_HI, PLACE_MASK_LO, PLACE_META, PLACE_NBR_COUNT, PLACE_NBRS,
     PLACE_TOP_ROW, PLACE_TOUCHES_EDGE, PLACE_VALID
 } from './geometry';
-import { EMPTY } from './indexBoard';
 import { type ScoringParams, scoreStat } from './scoring';
 import {
     FLAG_PURE_NEGATIVE, FLAG_RECEIVER, FLAG_SIDE_MOUNT, FLAG_TOP_MOUNT, FLAG_WHITE, nfCountOf, type PoolTables, recvBonus
@@ -30,6 +29,7 @@ export const evalPlacement = (
     entry: number,
     item: number,
     board: IndexBoard,
+    occupiedLo: number, occupiedHi: number,
     boardIsEmpty: boolean,
     params: ScoringParams,
     currentP: number, currentQ: number, currentE: number,
@@ -38,11 +38,7 @@ export const evalPlacement = (
     out.ok = false;
     const meta = PLACE_META[entry];
     if ((meta & PLACE_VALID) === 0) return;
-
-    const cellCount = PLACE_CELL_COUNT[entry];
-    for (let i = 0; i < cellCount; i++) {
-        if (board[PLACE_CELLS[entry * MAX_PIECE_CELLS + i]] !== EMPTY) return;
-    }
+    if (((PLACE_MASK_LO[entry] & occupiedLo) | (PLACE_MASK_HI[entry] & occupiedHi)) !== 0) return;
 
     const flags = tables.flags[item];
     const isWhite = (flags & FLAG_WHITE) !== 0;

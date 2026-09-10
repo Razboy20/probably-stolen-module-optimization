@@ -1,10 +1,10 @@
 /* A Weyl sequence hashed through lowbias32, all in 32-bit unsigned arithmetic so the same stream comes out of JavaScript and WGSL
  * Each stream has its own odd increment, so thousands of them seeded from consecutive thread ids never share a cycle
+ * The state is a two-word typed array, counter then increment: the engine draws tens of millions of times a second, and a typed array keeps the step to an add
  */
-export interface Rng {
-    ctr: number;
-    inc: number;
-}
+export type Rng = Uint32Array;
+export const RNG_CTR = 0;
+export const RNG_INC = 1;
 
 export const lowbias32 = (x: number) => {
     let z = x >>> 0;
@@ -16,18 +16,18 @@ export const lowbias32 = (x: number) => {
     return z >>> 0;
 };
 
-export const seedRng = (seed: number, thread: number): Rng => ({
-    ctr: lowbias32((Math.imul(thread, 0x9e3779b9) + seed) >>> 0),
-    inc: (lowbias32((thread ^ seed) >>> 0) | 1) >>> 0
-});
+export const seedRng = (seed: number, thread: number): Rng => Uint32Array.of(
+    lowbias32((Math.imul(thread, 0x9e3779b9) + seed) >>> 0),
+    lowbias32((thread ^ seed) >>> 0) | 1
+);
 
 export const rngNext = (rng: Rng) => {
-    rng.ctr = (rng.ctr + rng.inc) >>> 0;
-    return lowbias32(rng.ctr);
+    rng[RNG_CTR] += rng[RNG_INC];
+    return lowbias32(rng[RNG_CTR]);
 };
 
-// Uniform in [0, n) for the small n the search draws
-export const rngBelow = (rng: Rng, n: number) => rngNext(rng) % n;
+// Uniform in [0, n) for the small n the search draws: the top sixteen bits scaled to n, which stays in integer arithmetic where a modulo of a full 32-bit word does not
+export const rngBelow = (rng: Rng, n: number) => ((rngNext(rng) >>> 16) * n) >>> 16;
 
 export const rngCoinFlip = (rng: Rng) => (rngNext(rng) & 1) === 1;
 

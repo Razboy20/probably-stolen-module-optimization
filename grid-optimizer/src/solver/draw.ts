@@ -1,4 +1,5 @@
 import type { Stats } from '../types';
+import { SHAPE_COUNT } from './geometry';
 import { type MachineConfig, STAT_KEYS, statIsIgnored, type TierPlan, tierBoost } from './objective';
 import { FLAG_WHITE, type PoolTables } from './tables';
 /* What each pool entry is worth to this machine per cell it occupies, used to decide which modules the fill is offered
@@ -15,6 +16,36 @@ import { FLAG_WHITE, type PoolTables } from './tables';
  * The draw only ever asks which of two entries is worth more, so each table holds the rank of the entry's value rather than the value itself
  */
 export const TARGET_MET_DRAW_SCALE = 0.25;
+
+// How many random candidates a draw compares before taking the best of them
+// 1 is a uniform draw; higher steers the fill toward high-value modules without ever ruling any out
+export const DRAW_TOURNAMENT = 4;
+// Rounds of the draw a fill is given before it stops offering modules, in case every module of a shape that still fits is already on the board
+export const MAX_DRAWS = 192;
+
+/* The draw list held in shape order, with the start of each shape's run, so the fill can draw from just the shapes that still fit
+ * The drawable items are also marked per pool index, because the fill counts how many of each shape are already on the board
+ */
+export interface DrawLayout {
+    drawList: Int32Array;
+    shapeStart: Int32Array;
+    drawable: Uint8Array;
+}
+
+export const layoutDraw = (tables: PoolTables, items: Int32Array): DrawLayout => {
+    const shapeStart = new Int32Array(SHAPE_COUNT + 1);
+    for (let i = 0; i < items.length; i++) shapeStart[tables.shape[items[i]] + 1]++;
+    for (let s = 0; s < SHAPE_COUNT; s++) shapeStart[s + 1] += shapeStart[s];
+
+    const drawList = new Int32Array(items.length);
+    const fill = Int32Array.from(shapeStart);
+    const drawable = new Uint8Array(tables.count);
+    for (let i = 0; i < items.length; i++) {
+        drawList[fill[tables.shape[items[i]]]++] = items[i];
+        drawable[items[i]] = 1;
+    }
+    return { drawList, shapeStart, drawable };
+};
 
 const rankValues = (values: Float64Array) => {
     const distinct = [...new Set(values)].sort((a, b) => a - b);

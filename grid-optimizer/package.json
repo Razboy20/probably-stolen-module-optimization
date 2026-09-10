@@ -13,7 +13,8 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.112.3",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "typegpu": "^0.12.5"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -27,6 +28,7 @@
     "globals": "^17.7.0",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.65.0",
+    "unplugin-typegpu": "^0.12.3",
     "vite": "^8.2.0"
   }
 }

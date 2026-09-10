@@ -1,9 +1,7 @@
 import type { SolveUpdate } from '../src/solver/engine';
 import { runSolver, type SolverBackend } from '../src/solver/client';
-import { initializeBoard } from '../src/solver/board';
-import type { MachineConfig } from '../src/solver/objective';
-import { EFFECTS_LIST, MODULE_TEMPLATES } from '../src/constants';
-import type { InventoryItem, ItemEffect, Stats } from '../src/types';
+import type { Stats } from '../src/types';
+import { buildBenchCase } from './benchCase';
 import process from 'node:process';
 
 const SEED = Number(process.env.SEED ?? 1);
@@ -14,46 +12,12 @@ const TARGETS = process.env.TARGETS === '1';
 const IMPL = (process.env.IMPL ?? 'inline') as SolverBackend;
 const WORKERS = process.env.WORKERS ? Number(process.env.WORKERS) : undefined;
 
-let seed = SEED * 7919 + 12345;
-const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
-Math.random = rnd;
-
-const inv: InventoryItem[] = [];
-for (let i = 0; i < N; i++) {
-    const t = MODULE_TEMPLATES[Math.floor(rnd() * 27)];
-    const eff = (): ItemEffect => rnd() < 0.5 ? 'None' : EFFECTS_LIST[1 + Math.floor(rnd() * 9)];
-    inv.push({ id: `m${i}`, shape: t.shape, color: t.color, displayName: t.displayName, effects: [eff(), eff()], effectValues: [20, 20] });
-}
-const node: InventoryItem = { id: 'node', shape: 'Node1x2', color: 'White', displayName: 'Node', effects: ['None', 'None'], effectValues: [0, 0], isInfinite: true };
-inv.push(node);
-for (let i = 0; i < 17; i++) inv.push({ ...node, id: `node_clone_${i}` });
-
-const machine: MachineConfig = TARGETS ? {
-    id: 'mach0', tier: 3,
-    targetStats: { Performance: 200, Quality: 80, Efficiency: null },
-    maximizeStats: { Performance: false, Quality: true, Efficiency: true },
-    ignoreStats: { Performance: false, Quality: false, Efficiency: false },
-    statPriority: { Performance: 1, Quality: 2, Efficiency: 3 },
-} : {
-    id: 'mach0', tier: 3,
-    targetStats: { Performance: null, Quality: null, Efficiency: null },
-    maximizeStats: { Performance: true, Quality: true, Efficiency: true },
-};
-
-const board = initializeBoard(machine.tier);
-if (TARGETS) {
-    const blast: InventoryItem = { id: 'blast', shape: 'Line4', color: 'Grey', displayName: 'Furnace Module (Blast)', effects: ['None', 'None'], effectValues: [0, 0] };
-    const locked: InventoryItem = { id: 'lockedsq', shape: 'Square4_Base', color: 'Red', displayName: 'Performance', effects: ['Premium', 'None'], effectValues: [20, 20], isLocked: true };
-    inv.push(blast, locked);
-    for (let x = 0; x < 4; x++) board[4][x] = blast;
-    board[0][5] = board[0][6] = board[1][5] = board[1][6] = locked;
-}
-
+const { machine, board, inv } = buildBenchCase(SEED, N, TARGETS);
 
 let latest = null as SolveUpdate | null;
-const checkpoints: Record<string, Stats | null> = {};
+const checkpoints: Record<string, { totals: Stats; tiers: number[] } | null> = {};
 for (const ms of [250, 1000, 3000, 10000]) {
-    if (ITERS === 0 && ms <= MS) setTimeout(() => { checkpoints[ms] = latest?.totals ?? null; }, ms);
+    if (ITERS === 0 && ms <= MS) setTimeout(() => { checkpoints[ms] = latest ? { totals: latest.totals, tiers: latest.tiers } : null; }, ms);
 }
 
 const t0 = performance.now();
