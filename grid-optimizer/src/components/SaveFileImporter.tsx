@@ -6,6 +6,34 @@ interface SaveFileImporterProps {
     onImport: (newItems: InventoryItem[], newMachines: { id: string, boardIds: (string | null)[][], machineType: string, tier: GridTier }[]) => void;
 }
 
+const isHex = (c: string | undefined) => c !== undefined && /[0-9a-fA-F]/.test(c);
+
+const isValidEscape = (json: string, backslashIdx: number) => {
+    const next = json[backslashIdx + 1];
+    if (next === undefined) return false;
+    if (next === 'u') {
+        return isHex(json[backslashIdx + 2]) && isHex(json[backslashIdx + 3]) &&
+            isHex(json[backslashIdx + 4]) && isHex(json[backslashIdx + 5]);
+    }
+    return '"\\/bfnrt'.includes(next);
+};
+
+// Localized item names carry literal backslashes the game never escapes, so a
+// stray one has to be read as a backslash instead of starting an escape.
+const repairStrayEscapes = (json: string): string => {
+    let out = '';
+    let copiedTo = 0;
+
+    for (let i = 0; i < json.length; i++) {
+        if (json[i] !== '\\') continue;
+        if (isValidEscape(json, i)) { i++; continue; }
+        out += json.substring(copiedTo, i) + '\\\\';
+        copiedTo = i + 1;
+    }
+
+    return copiedTo === 0 ? json : out + json.substring(copiedTo);
+};
+
 export default function SaveFileImporter({ onImport }: SaveFileImporterProps) {
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -78,7 +106,7 @@ export default function SaveFileImporter({ onImport }: SaveFileImporterProps) {
         const reader = new FileReader();
         reader.onload = (evt) => {
             try {
-                const text = evt.target?.result as string;
+                const text = repairStrayEscapes(evt.target?.result as string);
 
                 const keyIdx = text.indexOf('"mainInvJSON"');
                 if (keyIdx === -1) throw new Error("Could not find mainInvJSON in save file.");
@@ -95,7 +123,7 @@ export default function SaveFileImporter({ onImport }: SaveFileImporterProps) {
                 if (quoteEnd === -1) throw new Error("Malformed mainInvJSON string.");
 
                 const invStr = JSON.parse(text.substring(quoteStart, quoteEnd + 1));
-                const invData = JSON.parse(invStr);
+                const invData = JSON.parse(repairStrayEscapes(invStr));
                 const saveItems = invData.saveItems || [];
 
                 const itemMap = new Map();
