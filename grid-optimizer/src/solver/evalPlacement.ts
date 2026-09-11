@@ -10,7 +10,7 @@ import {
 
 /* The worth of one placement, as an ordered pair rather than a float
  * `major` is the stat score less a thousand per contact between a node and a purely negative module (or a flat -10000 less those when the placement scores nothing)
- * `minor` breaks ties by adjacent nodes. Comparing (major, minor) lexicographically orders placements exactly as the old float score did
+ * `minor` breaks ties by adjacent nodes: more of them for a placement that scores, fewer for one that does not
  */
 export interface PlaceScore {
     ok: boolean;
@@ -145,5 +145,6 @@ export const evalPlacement = (
 
     out.ok = true;
     out.major = (statScore <= 0 ? NO_SCORE_MAJOR : statScore) - negativeContacts * NEGATIVE_CONTACT_PENALTY;
-    out.minor = adjNodes;
+    // A placement that earns nothing wants the nodes least: every node it touches is a slot a paying module could have had
+    out.minor = statScore <= 0 ? -adjNodes : adjNodes;
 };

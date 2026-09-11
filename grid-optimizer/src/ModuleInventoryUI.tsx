@@ -4,6 +4,7 @@ import { COLOR_MAP, EFFECT_COLORS, EFFECTS_LIST, MODULE_TEMPLATES, NODE_TEMPLATE
 import { formatStatValue, getStatColor, getBaseStats, PRECOMPUTED_OFFSETS } from './utils';
 import { useOptimizer } from './hooks/useOptimizer';
 import { useJointSolve } from './hooks/useJointSolve';
+import { isLockedModule } from './solver/locked';
 import { hasObjective, STAT_KEYS } from './solver/objective';
 import MiniShape from './components/MiniShape';
 import SaveFileImporter from './components/SaveFileImporter';
@@ -61,10 +62,11 @@ const DragGhost = ({ dragState, cellSize }: { dragState: any, cellSize: number }
 };
 
 const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, updateItemEffectValue, handleBlurEffectValue, onRemove, onDragStart, onToggleInfinite, onToggleLock }: any) => {
+    const locked = isLockedModule(item);
     return (
         <div
             onMouseDown={(e) => onDragStart(e, item)}
-            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `4px solid ${COLOR_MAP[item.color as ModuleColor]}`, cursor: (isAnySolving || item.isLocked) ? 'default' : 'grab', opacity: item.isLocked ? 0.6 : 1 }}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `4px solid ${COLOR_MAP[item.color as ModuleColor]}`, cursor: (isAnySolving || locked) ? 'default' : 'grab', opacity: locked ? 0.6 : 1 }}
         >
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', width: '100%' }}>
                 <MiniShape shape={item.shape} colorHex={COLOR_MAP[item.color as ModuleColor]} size="10px" />
@@ -128,12 +130,13 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
             <div style={{ display: 'flex', marginLeft: '8px', alignItems: 'center', gap: '4px' }}>
                 <button
                     onMouseDown={(e) => e.stopPropagation()}
-                    onClick={() => onToggleLock(item.id, !item.isLocked)}
+                    onClick={() => onToggleLock(item.id, !locked)}
                     disabled={isAnySolving}
+                    title="A locked module stays on its machine; the optimizer only moves it around that board"
                     style={{
-                        background: item.isLocked ? 'rgba(255, 77, 77, 0.1)' : 'transparent',
-                        border: `1px solid ${item.isLocked ? '#ff4d4d' : '#555'}`,
-                        color: item.isLocked ? '#ff4d4d' : '#aaa',
+                        background: locked ? 'rgba(255, 77, 77, 0.1)' : 'transparent',
+                        border: `1px solid ${locked ? '#ff4d4d' : '#555'}`,
+                        color: locked ? '#ff4d4d' : '#aaa',
                         borderRadius: '4px',
                         padding: '4px 8px',
                         cursor: isAnySolving ? 'not-allowed' : 'pointer',
@@ -142,7 +145,7 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
                         minWidth: '60px'
                     }}
                 >
-                    {item.isLocked ? 'Unlock' : 'Lock'}
+                    {locked ? 'Unlock' : 'Lock'}
                 </button>
                 <button
                     onMouseDown={(e) => e.stopPropagation()}
@@ -879,14 +882,14 @@ export default function ModuleInventoryUI() {
 
             if (currentDrag) {
                 if (!currentTarget || currentTarget.machineId === null) {
-                    if (currentDrag.sourceMachineId !== null && !currentDrag.item.isLocked) {
+                    if (currentDrag.sourceMachineId !== null && !isLockedModule(currentDrag.item)) {
                         machinesRef.current[currentDrag.sourceMachineId]?.remove(currentDrag.item.id);
                     }
                 } else {
                     const machine = machinesRef.current[currentTarget.machineId];
 
-                    if (currentDrag.item.isLocked && currentDrag.sourceMachineId !== currentTarget.machineId) {
-                        // Prevent moving a locked module into a different machine
+                    if (isLockedModule(currentDrag.item) && currentDrag.sourceMachineId !== currentTarget.machineId) {
+                        // A locked module stays on its machine
                     } else if (machine) {
                         const targetX = currentTarget.x - currentDrag.dragOffsetX;
                         const targetY = currentTarget.y - currentDrag.dragOffsetY;
@@ -1104,7 +1107,7 @@ export default function ModuleInventoryUI() {
     }, []);
 
     const handleInventoryDragStart = useCallback((e: React.MouseEvent, item: InventoryItem) => {
-        if (isAnySolving || item.isLocked) { e.preventDefault(); return; }
+        if (isAnySolving || isLockedModule(item)) { e.preventDefault(); return; }
         e.preventDefault();
         const offsets = PRECOMPUTED_OFFSETS.get(item.shape)?.[0] || [{x: 0, y: 0}];
 
@@ -1177,7 +1180,7 @@ export default function ModuleInventoryUI() {
         : filteredInventory;
     const hiddenInventoryCount = filteredInventory.length - visibleInventory.length;
 
-    const allDisplayedLocked = filteredInventory.length > 0 && filteredInventory.every(item => item.isLocked);
+    const allDisplayedLocked = filteredInventory.length > 0 && filteredInventory.every(isLockedModule);
 
     const handleToggleDisplayLock = () => {
         const targetState = !allDisplayedLocked;

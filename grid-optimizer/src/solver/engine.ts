@@ -30,6 +30,12 @@ export const STAGNATION_LIMIT = 150;
  */
 export const STEAL_ONE_IN = 4;
 
+/* One iteration in so many drops the board's fixed pieces at random free placements instead of their best fit, and lets acceptance judge the result
+ * A fixed piece's own score says nothing about what it costs the others: an Alarm across the top row scores the same as one anywhere else, while the
+ * Top Mount modules that wanted that row do not. The best fit alone leaves it wherever the user put it
+ */
+export const WANDER_ONE_IN = 4;
+
 // Unbiased Fisher-Yates over the first `count` entries
 // `sort(() => Math.random() - 0.5)` is not a shuffle: it leaves the ordering strongly correlated with the input, which narrows the range of layouts the solver actually explores
 const shuffleInPlace = (rng: Rng, arr: Int32Array, count: number) => {
@@ -254,13 +260,38 @@ export const runOptimizationEngine = async (
         }
 
         if (bestEntry === -1) return false;
-
-        const cellCount = PLACE_CELL_COUNT[bestEntry];
-        for (let i = 0; i < cellCount; i++) testBoard[PLACE_CELLS[bestEntry * MAX_PIECE_CELLS + i]] = item;
-        occupiedLo |= PLACE_MASK_LO[bestEntry];
-        occupiedHi |= PLACE_MASK_HI[bestEntry];
-        compactFreeCells();
+        commitPlacement(bestEntry, item);
         return true;
+    };
+
+    const commitPlacement = (entry: number, item: number) => {
+        const cellCount = PLACE_CELL_COUNT[entry];
+        for (let i = 0; i < cellCount; i++) testBoard[PLACE_CELLS[entry * MAX_PIECE_CELLS + i]] = item;
+        occupiedLo |= PLACE_MASK_LO[entry];
+        occupiedHi |= PLACE_MASK_HI[entry];
+        compactFreeCells();
+    };
+
+    const placementIsOpen = (entry: number) =>
+        (PLACE_META[entry] & PLACE_VALID) !== 0 && ((PLACE_MASK_LO[entry] & occupiedLo) | (PLACE_MASK_HI[entry] & occupiedHi)) === 0;
+
+    // A uniformly random open placement; the piece's own cells are free, so there is always at least one
+    const placeAnywhere = (item: number) => {
+        const orientStart = tables.orientStart[item];
+        const orientEnd = orientStart + tables.orientCount[item];
+        let open = 0;
+        for (let c = 0; c < freeCount; c++) {
+            for (let g = orientStart; g < orientEnd; g++) if (placementIsOpen(placeEntry(g, freeCells[c]))) open++;
+        }
+        let pick = rngBelow(rng, open);
+        for (let c = 0; c < freeCount; c++) {
+            for (let g = orientStart; g < orientEnd; g++) {
+                const entry = placeEntry(g, freeCells[c]);
+                if (!placementIsOpen(entry)) continue;
+                if (pick === 0) { commitPlacement(entry, item); return; }
+                pick--;
+            }
+        }
     };
 
     // The cells were collected in row-major order, and an orientation's cells are in that same order and anchored on its first cell,
@@ -443,6 +474,7 @@ export const runOptimizationEngine = async (
              * first one take the second one's cells and leave the second with nowhere guaranteed to go
              * Going before the draw also means they choose out of the whole ruined area rather than whatever the fill leaves over
              */
+            const wander = fixedCount > 0 && rngBelow(rng, WANDER_ONE_IN) === 0;
             for (let f = 0; f < fixedCount; f++) {
                 const home = homeEntryOf(f);
                 for (let c = 0; c < fixedCellCount[f]; c++) {
@@ -452,7 +484,8 @@ export const runOptimizationEngine = async (
                     occupiedHi &= ~cellMaskHi(idx);
                     freeCells[freeCount++] = idx;
                 }
-                placeBestFit(fixedItem[f], boardIsEmpty, home);
+                if (wander) placeAnywhere(fixedItem[f]);
+                else placeBestFit(fixedItem[f], boardIsEmpty, home);
                 boardIsEmpty = false;
                 if (needsTotals) boardTotals(tables, testBoard, fillTotals);
             }

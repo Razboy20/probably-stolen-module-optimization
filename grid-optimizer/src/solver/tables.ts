@@ -3,13 +3,13 @@ import { applyInternalEffects, PRECOMPUTED_ORIENTATIONS, roundStat } from '../ut
 import type { Board } from './board';
 import { countEffect } from './boardStats';
 import { MAX_PIECE_NEIGHBORS, ORIENT_COUNT, ORIENT_START, shapeIndexOf } from './geometry';
-import { isSpecialModule } from './pool';
+import { isLockedModule } from './locked';
 
 export const FLAG_WHITE = 1;
 export const FLAG_SIDE_MOUNT = 2;
 export const FLAG_TOP_MOUNT = 4;
 export const FLAG_RECEIVER = 8;
-// A special or user-locked module: the search moves it but never adds or removes one
+// A locked module: the search moves it around its board but never adds or removes one
 export const FLAG_FIXED = 16;
 export const FLAG_PURE_NEGATIVE = 32;
 export const NF_SHIFT = 6;
@@ -94,7 +94,7 @@ export const buildPoolTables = (inventory: InventoryItem[], boards: Board[]): Po
         if (item.effects.includes('Side Mount')) f |= FLAG_SIDE_MOUNT;
         if (item.effects.includes('Top Mount')) f |= FLAG_TOP_MOUNT;
         if (item.effects.includes('Receiver')) f |= FLAG_RECEIVER;
-        if (isSpecialModule(item) || item.isLocked) f |= FLAG_FIXED;
+        if (isLockedModule(item)) f |= FLAG_FIXED;
         if (ip <= 0 && iq <= 0 && ie <= 0 && (ip < 0 || iq < 0 || ie < 0)) f |= FLAG_PURE_NEGATIVE;
         f |= countEffect(item, 'Negative Feedback') << NF_SHIFT;
         flags[i] = f;

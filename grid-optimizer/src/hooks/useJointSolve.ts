@@ -1,6 +1,7 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from 'react';
 import type { Board } from '../solver/board';
 import { runSolver, type SolverHandle } from '../solver/client';
+import { isLockedModule } from '../solver/locked';
 import { hasObjective, type MachineConfig } from '../solver/objective';
 import type { BoardUpdate } from '../solver/report';
 import type { InventoryItem } from '../types';
@@ -43,7 +44,7 @@ export const useJointSolve = (machinesRef: RefObject<Record<string, MachineHandl
             if (!ids.includes(id)) for (const itemId of boardItemIds(machine.getBoard())) usedOutside.add(itemId);
         }
 
-        const poolIsEmpty = items.every(item => item.isLocked || usedOutside.has(item.id));
+        const poolIsEmpty = items.every(item => isLockedModule(item) || usedOutside.has(item.id));
         const boardsAreEmpty = handles.every(h => boardItemIds(h.getBoard()).size === 0);
         if (poolIsEmpty && boardsAreEmpty) {
             handles.forEach(h => h.setWarning('Cannot optimize: No unused modules available.'));

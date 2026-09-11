@@ -1,6 +1,6 @@
 import tgpu, { d, type TgpuRoot } from 'typegpu';
 import { DRAW_TOURNAMENT, MAX_DRAWS } from '../draw';
-import { FRESH_START_EVERY, STEAL_ONE_IN } from '../engine';
+import { FRESH_START_EVERY, STEAL_ONE_IN, WANDER_ONE_IN } from '../engine';
 import {
     BOARD_CELLS, BOARD_H, BOARD_W, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, PLACE_LEFT_COL, PLACE_TOP_ROW, PLACE_TOUCHES_EDGE, PLACE_VALID, SCAN_STRIDES,
     SHAPE_COUNT
@@ -203,9 +203,13 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
 
         s.scoreOk.$ = 1;
         let major = statScore;
-        if (statScore <= 0) major = NO_SCORE_MAJOR;
+        let minor = adjNodes;
+        if (statScore <= 0) {
+            major = NO_SCORE_MAJOR;
+            minor = -adjNodes;
+        }
         s.scoreMajor.$ = major - negativeContacts * NEGATIVE_CONTACT_PENALTY;
-        s.scoreMinor.$ = adjNodes;
+        s.scoreMinor.$ = minor;
     };
 
     const neighborCell = (x: number, y: number, dir: number) => {
@@ -479,13 +483,48 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         }
 
         if (bestEntry === -1) return false;
-
-        const cellCount = geometry.$[GEO_CELL_COUNT + bestEntry];
-        for (let i = 0; i < cellCount; i++) s.test.$[geometry.$[GEO_CELLS + bestEntry * MAX_PIECE_CELLS + i]] = item;
-        s.occLo.$ = s.occLo.$ | geometry.$[GEO_MASK_LO + bestEntry];
-        s.occHi.$ = s.occHi.$ | geometry.$[GEO_MASK_HI + bestEntry];
-        compactFreeCells();
+        commitPlacement(bestEntry, item);
         return true;
+    };
+
+    const commitPlacement = (entry: number, item: number) => {
+        'use gpu';
+        const cellCount = geometry.$[GEO_CELL_COUNT + entry];
+        for (let i = 0; i < cellCount; i++) s.test.$[geometry.$[GEO_CELLS + entry * MAX_PIECE_CELLS + i]] = item;
+        s.occLo.$ = s.occLo.$ | geometry.$[GEO_MASK_LO + entry];
+        s.occHi.$ = s.occHi.$ | geometry.$[GEO_MASK_HI + entry];
+        compactFreeCells();
+    };
+
+    const placementIsOpen = (entry: number) => {
+        'use gpu';
+        if ((geometry.$[GEO_META + entry] & PLACE_VALID) === 0) return false;
+        return ((geometry.$[GEO_MASK_LO + entry] & s.occLo.$) | (geometry.$[GEO_MASK_HI + entry] & s.occHi.$)) === 0;
+    };
+
+    // A uniformly random open placement; the piece's own cells are free, so there is always at least one
+    const placeAnywhere = (item: number) => {
+        'use gpu';
+        const orientStart = pool.$[item].orientStart;
+        const orientEnd = orientStart + pool.$[item].orientCount;
+        let open = 0;
+        for (let c = 0; c < s.freeCount.$; c++) {
+            for (let g = orientStart; g < orientEnd; g++) {
+                if (placementIsOpen(g * BOARD_CELLS + s.freeCells.$[c])) open = open + 1;
+            }
+        }
+        let pick = rngBelow(open);
+        for (let c = 0; c < s.freeCount.$; c++) {
+            for (let g = orientStart; g < orientEnd; g++) {
+                const entry = g * BOARD_CELLS + s.freeCells.$[c];
+                if (!placementIsOpen(entry)) continue;
+                if (pick === 0) {
+                    commitPlacement(entry, item);
+                    return;
+                }
+                pick = pick - 1;
+            }
+        }
     };
 
     // The shift test of shapeFitsFree in ../geometry.ts, so the draw never has to offer a module of a shape with nowhere to go
@@ -655,6 +694,8 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
 
     const relocateFixed = (fixedCount: number) => {
         'use gpu';
+        let wander = false;
+        if (fixedCount > 0 && rngBelow(WANDER_ONE_IN) === 0) wander = true;
         for (let f = 0; f < fixedCount; f++) {
             const home = homeEntryOf(f);
             for (let c = 0; c < s.fixedCellCount.$[f]; c++) {
@@ -665,7 +706,8 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
                 s.freeCells.$[s.freeCount.$] = idx;
                 s.freeCount.$ = s.freeCount.$ + 1;
             }
-            placeBestFit(s.fixedItem.$[f], home);
+            if (wander) placeAnywhere(s.fixedItem.$[f]);
+            else placeBestFit(s.fixedItem.$[f], home);
             s.boardIsEmpty.$ = 0;
             if (s.mNeedsTotals.$ !== 0) refreshFillTotals();
         }

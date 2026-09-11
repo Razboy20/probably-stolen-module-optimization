@@ -1,14 +1,6 @@
 import type { InventoryItem, ItemEffect, Stats } from '../types';
+import { isLockedModule } from './locked';
 import { type MachineConfig, STAT_KEYS, statIsScored } from './objective';
-
-// Alarm / Junk Processing / Blast modules exist for reasons the grid does not model
-// On stats alone they are neutral at best and negative at worst, so a stat optimizer left to its own devices either ignores them or, worse, treats them as free filler
-// Deciding how many of them a build should carry is a separate question from maximising stats, so the solver neither adds one nor takes one off a board
-// Where they sit is still the solver's problem. A Blast module against a Node costs real stats, so a special already on a board is free to move around it
-export const isSpecialModule = (item: InventoryItem) =>
-    item.displayName.includes('Alarm Module')
-    || item.displayName.includes('Junk Processing')
-    || item.displayName.includes('Blast Module');
 
 // Effects whose value depends on where the module ends up (edge contact, adjacent nodes, adjacent negatives)
 // Modules carrying different ones cannot be compared on their stats alone, so they are only ever compared against modules carrying the same ones
@@ -36,8 +28,9 @@ const dominates = (a: number[], b: number[]) => {
  * Three things keep this from throwing away real options: modules are only compared within the same shape and the same placement-dependent effects,
  * stats the machine does not score on are left out of the comparison entirely, and enough candidates are kept per group to fill the board,
  * so pruning can never make a layout unreachable for lack of copies
- * Nodes are never dropped, and the special modules are left out of the pool entirely
+ * Nodes are never dropped, and locked modules are left out of the pool entirely
  * The pool is what the fill draws NEW modules from, and those are never the solver's to add
+ * Where a locked module already on a board sits is still the solver's problem. A Blast module against a Node costs real stats, so it is free to move around its board
  */
 export const buildSearchPool = (
     inventory: InventoryItem[],
@@ -46,15 +39,14 @@ export const buildSearchPool = (
 ): InventoryItem[] => {
     const scoredKeys = STAT_KEYS.filter(key => statIsScored(machine, key));
 
-    if (scoredKeys.length === 0) return inventory.filter(item => !isSpecialModule(item) && !item.isLocked);
+    if (scoredKeys.length === 0) return inventory.filter(item => !isLockedModule(item));
 
     const keepCap = MAX_PIECES_PER_BOARD;
     const kept: InventoryItem[] = [];
     const groups = new Map<string, Map<string, InventoryItem[]>>();
 
     for (const item of inventory) {
-        if (isSpecialModule(item)) continue;
-        if (item.isLocked) continue;
+        if (isLockedModule(item)) continue;
 
         if (item.color === 'White') {
             kept.push(item);
