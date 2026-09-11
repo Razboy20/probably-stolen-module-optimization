@@ -391,15 +391,21 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
     const objectiveTiers = () => {
         'use gpu';
         for (let i = 0; i < TIER_VECTOR_LENGTH; i++) s.scoredTiers.$[i] = 0;
+        let waste = s.totPieces.$ * DENSITY_TIER_WEIGHT;
         for (let stat = 0; stat < 3; stat++) {
             const ti = statParam(STAT_TIER_OF, stat);
             if (ti < 0) continue;
             const t = statTotal(stat);
             const target = statParam(STAT_TARGET, stat);
-            if (statParam(STAT_HAS_TARGET, stat) !== 0 && t < target) s.scoredTiers.$[ti] = s.scoredTiers.$[ti] - (target - t) * 10000;
-            if (statParam(STAT_MAXIMIZE, stat) !== 0) s.scoredTiers.$[ti] = s.scoredTiers.$[ti] + t * 10;
+            const hasTarget = statParam(STAT_HAS_TARGET, stat) !== 0;
+            if (hasTarget && t < target) s.scoredTiers.$[ti] = s.scoredTiers.$[ti] - (target - t) * 10000;
+            if (statParam(STAT_MAXIMIZE, stat) !== 0) {
+                s.scoredTiers.$[ti] = s.scoredTiers.$[ti] + t * 10;
+            } else if (hasTarget && t > target) {
+                waste = waste + (t - target);
+            }
         }
-        s.scoredTiers.$[s.mTierCount.$] = -s.totPieces.$ * DENSITY_TIER_WEIGHT;
+        s.scoredTiers.$[s.mTierCount.$] = -waste;
     };
 
     // The set's objective is the sum of its boards' tier vectors, the boards touched this iteration taken from their fresh scores

@@ -5,6 +5,7 @@ import { type Board, initializeBoard } from '../solver/board';
 import { calculateBoardStats, indexInventoryById } from '../solver/boardStats';
 import { decodeSolution, generateCodeFromState, inventoryForCode } from '../solver/codec';
 import type { BoardUpdate } from '../solver/report';
+import { isLockedModule } from '../solver/locked';
 
 // Solves are run by the joint solve controller, which feeds this machine its record boards; isAnySolving is whether any machine is being solved
 export function useOptimizer(
@@ -87,8 +88,19 @@ export function useOptimizer(
         setSolutionCode('');
     };
 
-    const resetBoard = () => {
-        setBoardSync(initializeBoard(tier));
+    const emptyBoard = (keepLockedModules: boolean) => {
+        const fresh = initializeBoard(tier);
+        if (keepLockedModules) {
+            for (let y = 0; y < 5; y++) {
+                for (let x = 0; x < 7; x++) {
+                    const cell = boardRef.current[y][x];
+                    if (cell && cell !== 'Locked' && isLockedModule(cell) && fresh[y][x] !== 'Locked') {
+                        fresh[y][x] = cell;
+                    }
+                }
+            }
+        }
+        setBoardSync(fresh);
         setBestTotals({ Performance: 0, Quality: 0, Efficiency: 0 });
         setBestPieceStats(new Map());
         setWarningMsg(null);
@@ -99,6 +111,10 @@ export function useOptimizer(
         //setStatPriority({ Performance: 1, Quality: 1, Efficiency: 1 });
         setSolutionCode('');
     };
+
+    // A locked module stays put when its board is cleared; only wiping the inventory it came from takes it off
+    const resetBoard = () => emptyBoard(true);
+    const resetBoardIncludingLocked = () => emptyBoard(false);
 
     const applyUpdate = (update: BoardUpdate) => {
         setBoardSync(update.board);
@@ -240,7 +256,7 @@ export function useOptimizer(
         maximizeStats, setMaximizeStats, ignoreStats, setIgnoreStats,
         statPriority, setStatPriority, board, bestTotals, bestPieceStats,
         warningMsg, setWarningMsg, applyUpdate,
-        solutionCode, setSolutionCode, importSolution, resetBoard,
+        solutionCode, setSolutionCode, importSolution, resetBoard, resetBoardIncludingLocked,
         manuallyPlaceItem, manuallyRemoveItem, isValidPlacement, boardRef
     };
 }

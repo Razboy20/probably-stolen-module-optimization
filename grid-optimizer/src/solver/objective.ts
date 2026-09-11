@@ -68,20 +68,25 @@ export const buildTierPlan = (machine: MachineConfig): TierPlan => {
 export const tierBoost = (plan: TierPlan, stat: number) =>
     plan.tierOf[stat] < 0 ? 1 : Math.pow(PRIORITY_WEIGHT_STEP, plan.tierCount - 1 - plan.tierOf[stat]);
 
-// A tier per rank plus one more for the density reward, which is a general tiebreak and so can never take a ranked stat out of its own tier
+/* A tier per rank plus one more for waste, which is a general tiebreak and so can never take a ranked stat out of its own tier
+ * Waste is every piece on the board and every point a target is exceeded by without being maximized: neither earns the machine anything,
+ * and both hold modules that another machine, or a later run, could have used. So of two boards that meet the bound, the one that meets it exactly wins
+ */
 export const TIER_VECTOR_LENGTH = 4;
 export const DENSITY_TIER_WEIGHT = 5;
 
 export const objectiveTiers = (totals: BoardTotals, plan: TierPlan, params: ScoringParams, out: Int32Array) => {
     out.fill(0);
+    let waste = totals.pieces * DENSITY_TIER_WEIGHT;
     for (let s = 0; s < 3; s++) {
         const ti = plan.tierOf[s];
         if (ti < 0) continue;
         const t = s === 0 ? totals.p : s === 1 ? totals.q : totals.e;
         if (params.hasTarget[s] !== 0 && t < params.target[s]) out[ti] -= (params.target[s] - t) * 10000;
         if (params.maximize[s] !== 0) out[ti] += t * 10;
+        else if (params.hasTarget[s] !== 0 && t > params.target[s]) waste += t - params.target[s];
     }
-    out[plan.tierCount] -= totals.pieces * DENSITY_TIER_WEIGHT;
+    out[plan.tierCount] -= waste;
 };
 
 /* A set of machines is scored on the sum of their tier vectors

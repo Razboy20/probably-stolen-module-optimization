@@ -241,6 +241,7 @@ const MachineInstance = React.memo(forwardRef(({
         applyUpdate: optimizer.applyUpdate,
         setWarning: optimizer.setWarningMsg,
         clear: optimizer.resetBoard,
+        clearIncludingLocked: optimizer.resetBoardIncludingLocked,
         place: optimizer.manuallyPlaceItem,
         remove: optimizer.manuallyRemoveItem,
         getState: () => machineState,
@@ -1234,6 +1235,16 @@ export default function ModuleInventoryUI() {
         });
     };
 
+    // Emptying the inventory leaves no module to stay locked to a board, so this takes the locked ones off too
+    const handleClearInventory = () => {
+        setInventory([]);
+        Object.values(machinesRef.current).forEach((m: any) => {
+            if (m && typeof m.isLocked === 'function' && !m.isLocked()) {
+                m.clearIncludingLocked();
+            }
+        });
+    };
+
     const handleAddMachine = () => {
         setMachines(prev => [...prev, { id: `m_${Math.random().toString(36).substring(2,8)}` }]);
     };
@@ -1646,7 +1657,7 @@ export default function ModuleInventoryUI() {
                             {hiddenInventoryCount > 0 && <span style={{ color: '#666' }}> (showing {MAX_VISIBLE_INVENTORY_ROWS})</span>}
                         </span>
                         <button
-                            onClick={() => { setInventory([]); handleClearAll(); }}
+                            onClick={handleClearInventory}
                             disabled={isAnySolving || inventory.length === 0}
                             style={{
                                 background: 'none', border: 'none', color: (isAnySolving || inventory.length === 0) ? '#555' : '#ff4d4d',
