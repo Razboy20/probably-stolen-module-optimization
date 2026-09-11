@@ -1,7 +1,7 @@
 import { type RefObject, useCallback, useEffect, useRef, useState } from 'react';
 import type { Board } from '../solver/board';
 import { runSolver, type SolverHandle } from '../solver/client';
-import type { MachineConfig } from '../solver/objective';
+import { hasObjective, type MachineConfig } from '../solver/objective';
 import type { BoardUpdate } from '../solver/report';
 import type { InventoryItem } from '../types';
 
@@ -72,7 +72,8 @@ export const useJointSolve = (machinesRef: RefObject<Record<string, MachineHandl
     const transition = useCallback((next: (current: string[]) => string[]) => {
         queueRef.current = queueRef.current.then(async () => {
             const previous = runRef.current;
-            const ids = next(previous?.ids ?? []);
+            // A machine with nothing to optimize would only be emptied, so it never joins a solve
+            const ids = next(previous?.ids ?? []).filter(id => hasObjective(machinesRef.current![id].getState()));
             if (previous) {
                 previous.handle.stop();
                 await previous.handle.done.catch(() => undefined);
@@ -80,11 +81,13 @@ export const useJointSolve = (machinesRef: RefObject<Record<string, MachineHandl
             runRef.current = ids.length > 0 ? launch(ids) : null;
             setSolvingIds(new Set(runRef.current?.ids ?? []));
         });
-    }, [launch]);
+    }, [launch, machinesRef]);
 
     const start = useCallback((ids: string[]) => transition(current => [...new Set([...current, ...ids])]), [transition]);
     const stop = useCallback((id: string) => transition(current => current.filter(other => other !== id)), [transition]);
     const stopAll = useCallback(() => transition(() => []), [transition]);
+    // A board outside the set changed, so the running solve restarts to see which modules are free now
+    const refresh = useCallback(() => { if (runRef.current) transition(current => current); }, [transition]);
 
-    return { solvingIds, start, stop, stopAll };
+    return { solvingIds, start, stop, stopAll, refresh };
 };

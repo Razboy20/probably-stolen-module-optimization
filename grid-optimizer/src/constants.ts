@@ -29,6 +29,19 @@ export const EFFECTS_LIST: ItemEffect[] = [
     'Negative Feedback', 'Receiver', 'Side Mount', 'Top Mount', 'Learning Algorithm'
 ];
 
+// Chip colours: warm for effects that lift a module's stats, cold for placement-dependent ones, dull for the ones that hurt
+export const EFFECT_COLORS: { [key in Exclude<ItemEffect, 'None'>]: string } = {
+    Premium: '#e6b422',
+    Overcharged: '#ff7a1a',
+    'Negative Feedback': '#b565d8',
+    Inferior: '#8a8a8a',
+    Degrading: '#c0392b',
+    'Learning Algorithm': '#3fb8e8',
+    Receiver: '#5cc46a',
+    'Side Mount': '#4f8fe0',
+    'Top Mount': '#4f8fe0'
+};
+
 export const MODULE_TEMPLATES: ModuleTemplate[] = [];
 
 // Base & High Tier

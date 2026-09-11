@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, forwardRef, useImperativeHandle, useCallback, useMemo } from 'react';
 import type { Stats, GridTier, InventoryItem, FilterGroup, ItemEffect, ModuleTemplate, ModuleColor, Point } from './types';
-import { COLOR_MAP, EFFECTS_LIST, MODULE_TEMPLATES, NODE_TEMPLATE } from './constants';
+import { COLOR_MAP, EFFECT_COLORS, EFFECTS_LIST, MODULE_TEMPLATES, NODE_TEMPLATE } from './constants';
 import { formatStatValue, getStatColor, getBaseStats, PRECOMPUTED_OFFSETS } from './utils';
 import { useOptimizer } from './hooks/useOptimizer';
 import { useJointSolve } from './hooks/useJointSolve';
+import { hasObjective, STAT_KEYS } from './solver/objective';
 import MiniShape from './components/MiniShape';
 import SaveFileImporter from './components/SaveFileImporter';
 import BackendSelect from './components/BackendSelect';
@@ -11,16 +12,23 @@ import BackendSelect from './components/BackendSelect';
 // offload mouse tracking to useRef; performance
 const DragGhost = ({ dragState, cellSize }: { dragState: any, cellSize: number }) => {
     const ghostRef = useRef<HTMLDivElement>(null);
-    const mousePos = useRef({ x: dragState?.initialMouseX || 0, y: dragState?.initialMouseY || 0 });
+    const mouse = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
 
-    useEffect(() => {
-        if (!dragState) return;
+    // A new drag starts under the mouse; a re-render mid-drag (a rotation) keeps the ghost where the mouse last was
+    useLayoutEffect(() => {
+        if (!dragState) { mouse.current = null; return; }
+        if (!mouse.current || mouse.current.startX !== dragState.initialMouseX || mouse.current.startY !== dragState.initialMouseY) {
+            mouse.current = { startX: dragState.initialMouseX, startY: dragState.initialMouseY, x: dragState.initialMouseX, y: dragState.initialMouseY };
+        }
+        const place = (x: number, y: number) => {
+            if (!ghostRef.current) return;
+            ghostRef.current.style.left = `${x - (dragState.dragOffsetX * cellSize) - (cellSize / 2)}px`;
+            ghostRef.current.style.top = `${y - (dragState.dragOffsetY * cellSize) - (cellSize / 2)}px`;
+        };
+        place(mouse.current.x, mouse.current.y);
         const onMove = (e: MouseEvent) => {
-            mousePos.current = { x: e.clientX, y: e.clientY };
-            if (ghostRef.current) {
-                ghostRef.current.style.left = `${e.clientX - (dragState.dragOffsetX * cellSize) - (cellSize / 2)}px`;
-                ghostRef.current.style.top = `${e.clientY - (dragState.dragOffsetY * cellSize) - (cellSize / 2)}px`;
-            }
+            mouse.current = { ...mouse.current!, x: e.clientX, y: e.clientY };
+            place(e.clientX, e.clientY);
         };
         window.addEventListener('mousemove', onMove);
         return () => window.removeEventListener('mousemove', onMove);
@@ -33,8 +41,8 @@ const DragGhost = ({ dragState, cellSize }: { dragState: any, cellSize: number }
             position: 'fixed',
             pointerEvents: 'none',
             zIndex: 9999,
-            left: `${mousePos.current.x - (dragState.dragOffsetX * cellSize) - (cellSize / 2)}px`,
-            top: `${mousePos.current.y - (dragState.dragOffsetY * cellSize) - (cellSize / 2)}px`
+            left: `${dragState.initialMouseX - (dragState.dragOffsetX * cellSize) - (cellSize / 2)}px`,
+            top: `${dragState.initialMouseY - (dragState.dragOffsetY * cellSize) - (cellSize / 2)}px`
         }}>
             {dragState.offsets.map((pt: Point, idx: number) => (
                 <div key={idx} style={{
@@ -174,6 +182,7 @@ const MachineInstance = React.memo(forwardRef(({
                                                    cellSize,
                                                    onRun,
                                                    onStop,
+                                                   onBoardCleared,
                                                    onDragTargetRefChange,
                                                    isAnySolving,
                                                    isSolving,
@@ -190,6 +199,14 @@ const MachineInstance = React.memo(forwardRef(({
     });
 
     const currentSolving: boolean = isSolving;
+    const machineState = useMemo(() => ({
+        tier: optimizer.tier,
+        maximizeStats: optimizer.maximizeStats,
+        targetStats: optimizer.targetStats,
+        ignoreStats: optimizer.ignoreStats,
+        statPriority: optimizer.statPriority
+    }), [optimizer.tier, optimizer.maximizeStats, optimizer.targetStats, optimizer.ignoreStats, optimizer.statPriority]);
+    const canRun = currentSolving || (inventory.length > 0 && hasObjective(machineState));
 
     // Automatically load the machine name from save file
     const [machineType, setMachineType] = useState(() => {
@@ -223,17 +240,11 @@ const MachineInstance = React.memo(forwardRef(({
         clear: optimizer.resetBoard,
         place: optimizer.manuallyPlaceItem,
         remove: optimizer.manuallyRemoveItem,
-        getState: () => ({
-            tier: optimizer.tier,
-            maximizeStats: optimizer.maximizeStats,
-            targetStats: optimizer.targetStats,
-            ignoreStats: optimizer.ignoreStats,
-            statPriority: optimizer.statPriority
-        }),
+        getState: () => machineState,
         isValidPlacement: optimizer.isValidPlacement,
         getBoard: () => optimizer.boardRef.current,
         isLocked: () => isMachineLocked
-    }), [optimizer, isMachineLocked]);
+    }), [optimizer, machineState, isMachineLocked]);
 
     useEffect(() => {
         if (dragState && dragState.sourceMachineId === machineId && dragState.initialTarget && localHover === null) {
@@ -637,21 +648,22 @@ const MachineInstance = React.memo(forwardRef(({
                     <div style={{ display: 'flex', gap: '5px', width: '100%' }}>
                         <button
                             onClick={() => (currentSolving ? onStop(machineId) : onRun(machineId))}
-                            disabled={inventory.length === 0 && !currentSolving}
+                            disabled={!canRun}
+                            title={canRun ? undefined : 'Set a stat to maximize or a target first'}
                             style={{
                                 flex: 2, padding: '8px', fontSize: '0.85em',
                                 backgroundColor: currentSolving ? '#ff4d4d' : '#4caf50',
                                 color: 'white', border: 'none', borderRadius: '6px', fontWeight: 'bold',
-                                cursor: (inventory.length === 0 && !currentSolving) ? 'not-allowed' : 'pointer',
-                                opacity: (inventory.length === 0 && !currentSolving) ? 0.5 : 1
+                                cursor: canRun ? 'pointer' : 'not-allowed',
+                                opacity: canRun ? 1 : 0.5
                             }}
                         >
                             {currentSolving ? 'Stop Optimizer' : 'Run Optimizer'}
                         </button>
                         <button
-                            onClick={optimizer.resetBoard}
-                            disabled={isAnySolving}
-                            style={{ flex: 1, padding: '8px', fontSize: '0.85em', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '6px', cursor: isAnySolving ? 'not-allowed' : 'pointer' }}
+                            onClick={() => { optimizer.resetBoard(); onBoardCleared(); }}
+                            disabled={currentSolving}
+                            style={{ flex: 1, padding: '8px', fontSize: '0.85em', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '6px', cursor: currentSolving ? 'not-allowed' : 'pointer' }}
                         >
                             Clear
                         </button>
@@ -1251,11 +1263,15 @@ export default function ModuleInventoryUI() {
         setMachines(preservedMachines);
     };
 
+    // The copy takes the settings and machine type but starts with an empty board, since a module cannot stand on two machines
     const handleDuplicateMachine = useCallback((machineId: string) => {
         const machine = machinesRef.current[machineId];
-        if (machine) {
-            setMachines(prev => [...prev, { id: `m_${Math.random().toString(36).substring(2,8)}` }]);
-        }
+        if (!machine) return;
+        const newId = `m_${Math.random().toString(36).substring(2,8)}`;
+        localStorage.setItem(`optimizer_machine_${newId}`, JSON.stringify(machine.getState()));
+        const machineType = localStorage.getItem(`optimizer_machine_type_${machineId}`);
+        if (machineType) localStorage.setItem(`optimizer_machine_type_${newId}`, machineType);
+        setMachines(prev => [...prev, { id: newId }]);
     }, []);
 
     const handleDeleteMachine = useCallback((machineId: string) => {
@@ -1428,32 +1444,26 @@ export default function ModuleInventoryUI() {
                     <div style={{ fontWeight: 'bold', marginBottom: '4px', color: COLOR_MAP[hoveredItem.color] }}>
                         {hoveredItem.displayName}
                     </div>
-                    {(hoveredItem.effects[0] !== 'None' || hoveredItem.effects[1] !== 'None') && (
-                        <div style={{ fontSize: '0.75em', color: '#aaa', fontStyle: 'italic', marginBottom: '8px', borderBottom: '1px solid #333', paddingBottom: '5px' }}>
-                            {hoveredItem.effects.filter(e => e !== 'None').map((e) => {
-                                const actualIdx = hoveredItem.effects.indexOf(e as ItemEffect);
-                                const val = hoveredItem.effectValues[actualIdx];
-                                return `${e}${e === 'Learning Algorithm' || e === 'Degrading' ? ` (${val}%)` : ''}`;
-                            }).join(', ')}
-                        </div>
-                    )}
                     {hoverInfo.stats ? (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '0.9em', marginTop: '5px' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                <span style={{ color: '#aaa' }}>Perf:</span>
-                                <span style={{ color: getStatColor(hoverInfo.stats.Performance) }}>{formatStatValue(hoverInfo.stats.Performance)}</span>
-                            </div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                <span style={{ color: '#aaa' }}>Qual:</span>
-                                <span style={{ color: getStatColor(hoverInfo.stats.Quality) }}>{formatStatValue(hoverInfo.stats.Quality)}</span>
-                            </div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                <span style={{ color: '#aaa' }}>Effic:</span>
-                                <span style={{ color: getStatColor(hoverInfo.stats.Efficiency) }}>{formatStatValue(hoverInfo.stats.Efficiency)}</span>
-                            </div>
+                            {STAT_KEYS.map(key => (
+                                <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: '16px' }}>
+                                    <span style={{ color: '#aaa' }}>{key}:</span>
+                                    <span style={{ color: getStatColor(hoverInfo.stats![key]) }}>{formatStatValue(hoverInfo.stats![key])}</span>
+                                </div>
+                            ))}
                         </div>
                     ) : (
                         <div style={{ color: '#888', fontSize: '0.9em' }}>Calculating...</div>
+                    )}
+                    {(hoveredItem.effects[0] !== 'None' || hoveredItem.effects[1] !== 'None') && (
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px', marginTop: '8px', paddingTop: '6px', borderTop: '1px solid #333' }}>
+                            {hoveredItem.effects.map((e, idx) => e !== 'None' && (
+                                <span key={idx} style={{ fontSize: '0.8em', fontWeight: 'bold', color: EFFECT_COLORS[e], backgroundColor: `${EFFECT_COLORS[e]}22`, border: `1px solid ${EFFECT_COLORS[e]}`, borderRadius: '4px', padding: '2px 6px' }}>
+                                    {e}{e === 'Learning Algorithm' || e === 'Degrading' ? ` ${hoveredItem.effectValues[idx]}%` : ''}
+                                </span>
+                            ))}
+                        </div>
                     )}
 
                     {hoveredItem.originalPath && (
@@ -1497,6 +1507,7 @@ export default function ModuleInventoryUI() {
                         cellSize={cellSize}
                         onRun={runMachine}
                         onStop={jointSolve.stop}
+                        onBoardCleared={jointSolve.refresh}
                         onDragTargetRefChange={setDragTargetRefChange}
                         isAnySolving={isAnySolving}
                         isSolving={jointSolve.solvingIds.has(m.id)}

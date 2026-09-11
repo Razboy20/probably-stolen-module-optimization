@@ -26,6 +26,9 @@ export const priorityOf = (m: MachineConfig, key: keyof Stats) =>
 export const statIsScored = (m: MachineConfig, key: keyof Stats) =>
     !statIsIgnored(m, key) && (Boolean(m.maximizeStats?.[key]) || m.targetStats[key] !== null);
 
+// With nothing to maximize or reach, the only reward left is an empty board
+export const hasObjective = (m: Omit<MachineConfig, 'id'>) => STAT_KEYS.some(key => statIsScored({ id: '', ...m }, key));
+
 // How much harder the placement heuristic leans on a stat per rank it is above the least important one
 // The acceptance test is strictly ordered on its own; this only points the greedy fill in the same direction so it does not spend the search fighting the objective
 export const PRIORITY_WEIGHT_STEP = 4;
