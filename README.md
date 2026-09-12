@@ -1,75 +1,36 @@
-# React + TypeScript + Vite
+# Module Optimizer
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Places modules on machine grids to hit target Performance, Quality and Efficiency stats. Import a `.es3` save, pick targets per machine, and run. Several machines can be solved together so they share one module inventory.
 
-Currently, two official plugins are available:
+Fork of [hoydoy/probably-stolen-module-optimization](https://github.com/hoydoy/probably-stolen-module-optimization) with a rewritten solver.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Solver
 
-## React Compiler
+The search is an iterated local search over placements. It runs on one of four backends, chosen automatically or from the UI:
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- `gpu`: TypeGPU population search in WebGPU
+- `population`: one Web Worker per core
+- `workers`: a single Web Worker
+- `inline`: on the main thread
 
-## Expanding the ESLint configuration
+## Development
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```sh
+pnpm install
+pnpm dev
+pnpm build
+pnpm deploy   # Cloudflare Workers
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Benchmarks
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+Scripts in `scripts/` run the solver headlessly under Bun.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```sh
+pnpm bench                       # one machine, 3s, seed 1
+SEED=3 MS=10000 pnpm bench       # longer run on another case
+MACHINES=3 pnpm bench            # joint solve over three machines
+scripts/compare.sh <base> <cand> # A/B two checkouts over seeds 1-8
 ```
+
+`bench.ts` reads `SEED`, `N`, `MS`, `ITERS`, `TARGETS`, `IMPL`, `WORKERS`, `MACHINES`, `INDEPENDENT` and `PRESOLVE` from the environment. The search is stochastic, so judge changes on the compare table and never on a single run.
