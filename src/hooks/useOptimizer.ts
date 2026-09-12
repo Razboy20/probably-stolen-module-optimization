@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
 import type { GridTier, InventoryItem, Stats, TargetStats, Point } from '../types';
-import { saveToDatabase } from '../leaderboard';
 import { type Board, initializeBoard } from '../solver/board';
 import { calculateBoardStats, indexInventoryById } from '../solver/boardStats';
 import { decodeSolution, generateCodeFromState, inventoryForCode } from '../solver/codec';
@@ -234,17 +233,7 @@ export function useOptimizer(
 
             if (inventory.length > 0) {
                 const availableForCode = inventoryForCode(getInventoryForCode(), boardToCalculate);
-                const newCode = generateCodeFromState(tier, maximizeStats, targetStats, availableForCode, boardToCalculate);
-                setSolutionCode(newCode);
-
-                // Never publish a run that has no representable code
-                // It is an inventory past the 8-bit module count the format allows
-                if (newCode) {
-                    if (totals.Performance !== 0 || totals.Quality !== 0 || totals.Efficiency !== 0) {
-                        const timer = setTimeout(() => saveToDatabase(tier, totals, newCode, availableForCode), 30000); // save timer
-                        return () => clearTimeout(timer);
-                    }
-                }
+                setSolutionCode(generateCodeFromState(tier, maximizeStats, targetStats, availableForCode, boardToCalculate));
             } else {
                 setSolutionCode('');
             }

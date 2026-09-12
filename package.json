@@ -13,7 +13,6 @@
     "bench": "bun scripts/bench.ts"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.112.3",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "typegpu": "^0.12.5"
