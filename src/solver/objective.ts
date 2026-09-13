@@ -48,14 +48,19 @@ export interface TierPlan {
     tierOf: Int32Array;
 }
 
-export const buildTierPlan = (machine: MachineConfig): TierPlan => {
+// The ranks in play across a whole solve, so a rank means the same tier on every machine of the set
+export const activeRankOrder = (machines: MachineConfig[]): number[] => {
     const activeRanks = new Set<number>();
-    for (const key of STAT_KEYS) {
-        if (!statIsIgnored(machine, key)) activeRanks.add(priorityOf(machine, key));
+    for (const machine of machines) {
+        for (const key of STAT_KEYS) {
+            if (!statIsIgnored(machine, key)) activeRanks.add(priorityOf(machine, key));
+        }
     }
     if (activeRanks.size === 0) activeRanks.add(DEFAULT_STAT_PRIORITY);
-    const rankOrder = [...activeRanks].sort((a, b) => a - b);
+    return [...activeRanks].sort((a, b) => a - b);
+};
 
+export const buildTierPlan = (machine: MachineConfig, rankOrder: number[]): TierPlan => {
     const tierOf = new Int32Array(3).fill(-1);
     for (let s = 0; s < 3; s++) {
         const key = STAT_KEYS[s];

@@ -4,7 +4,7 @@ import { indexInventoryById } from './boardStats';
 import { buildDrawRanks, type DrawLayout, layoutDraw, targetedStats } from './draw';
 import { BOARD_CELLS } from './geometry';
 import { toIndexBoard } from './indexBoard';
-import { buildTierPlan, type MachineConfig, STAT_KEYS, statIsIgnored, tierBoost, type TierPlan } from './objective';
+import { activeRankOrder, buildTierPlan, type MachineConfig, STAT_KEYS, statIsIgnored, tierBoost, type TierPlan } from './objective';
 import { buildSearchPool } from './pool';
 import { buildScoringParams, MAX_TARGET, type ScoringParams } from './scoring';
 import { buildPoolTables, type PoolTables } from './tables';
@@ -57,12 +57,12 @@ export const boardOfSet = (set: Int32Array, machine: number) => set.subarray(mac
 // A shortfall costs 10000 per point per stat, and the sum over the set has to stay within 32 bits
 const targetCap = (machineCount: number) => Math.min(MAX_TARGET, Math.floor(2 ** 31 / (10000 * 3 * machineCount)));
 
-const prepareMachine = (tables: PoolTables, searchPoolInventory: InventoryItem[], { machine, initialBoard }: MachineRequest, cap: number): MachineSetup => {
+const prepareMachine = (tables: PoolTables, searchPoolInventory: InventoryItem[], { machine, initialBoard }: MachineRequest, cap: number, rankOrder: number[]): MachineSetup => {
     // Boards may already hold modules the search itself would not pick up, so the pruned pool is only used for choosing what to place
     const searchPool = buildSearchPool(searchPoolInventory, tables.internal, machine).filter(item => tables.indexOf.has(item.id));
     const draw = layoutDraw(tables, Int32Array.from(searchPool, item => tables.indexOf.get(item.id)!));
 
-    const plan = buildTierPlan(machine);
+    const plan = buildTierPlan(machine, rankOrder);
 
     // A stat marked ignored gets weight 0 so the placement heuristic stops steering away from it at all
     const placementWeights: Stats = { Performance: 0, Quality: 0, Efficiency: 0 };
@@ -95,8 +95,10 @@ export const prepareSolve = (request: SolveRequest): SolveSetup => {
     const inventoryById = indexInventoryById(fullInventory);
 
     const cap = targetCap(machines.length);
-    const machineSetups = machines.map(m => prepareMachine(tables, searchPoolInventory, m, cap));
-    const densityIndex = Math.max(...machineSetups.map(m => m.plan.tierCount));
+    // Priorities are compared across the whole set, so a rank 2 stat on one machine outranks a rank 3 stat on another
+    const rankOrder = activeRankOrder(machines.map(m => m.machine));
+    const machineSetups = machines.map(m => prepareMachine(tables, searchPoolInventory, m, cap, rankOrder));
+    const densityIndex = rankOrder.length;
 
     const initialSet = new Int32Array(BOARD_CELLS * machines.length);
     machines.forEach((m, k) => boardOfSet(initialSet, k).set(toIndexBoard(m.initialBoard, tables.indexOf)));
