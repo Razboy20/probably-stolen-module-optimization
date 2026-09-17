@@ -6,6 +6,9 @@ import { decodeSolution, generateCodeFromState, inventoryForCode } from '../solv
 import type { BoardUpdate } from '../solver/report';
 import { isLockedModule } from '../solver/locked';
 
+export type StatFlags = Record<keyof Stats, boolean>;
+export type StatRanks = Record<keyof Stats, number>;
+
 // Solves are run by the joint solve controller, which feeds this machine its record boards; isAnySolving is whether any machine is being solved
 export function useOptimizer(
     inventory: InventoryItem[],
@@ -41,9 +44,9 @@ export function useOptimizer(
     });
 
     const [targetStats, setTargetStats] = useState<TargetStats>(savedState?.targetStats ?? { Performance: null, Quality: null, Efficiency: null });
-    const [maximizeStats, setMaximizeStats] = useState(savedState?.maximizeStats ?? { Performance: false, Quality: false, Efficiency: false });
-    const [ignoreStats, setIgnoreStats] = useState(savedState?.ignoreStats ?? { Performance: false, Quality: false, Efficiency: false });
-    const [statPriority, setStatPriority] = useState(savedState?.statPriority ?? { Performance: 1, Quality: 1, Efficiency: 1 });
+    const [maximizeStats, setMaximizeStats] = useState<StatFlags>(savedState?.maximizeStats ?? { Performance: false, Quality: false, Efficiency: false });
+    const [ignoreStats, setIgnoreStats] = useState<StatFlags>(savedState?.ignoreStats ?? { Performance: false, Quality: false, Efficiency: false });
+    const [statPriority, setStatPriority] = useState<StatRanks>(savedState?.statPriority ?? { Performance: 1, Quality: 1, Efficiency: 1 });
 
     const [board, setBoard] = useState<Board>(() => initializeBoard(savedState?.tier ?? defaultTier, savedState?.boardIds, inventory));
     const boardRef = useRef(board);
@@ -52,31 +55,11 @@ export function useOptimizer(
         setBoard(newBoard);
     };
 
-    const [isInitializedFromSave, setIsInitializedFromSave] = useState(false);
-
-    useEffect(() => {
-        if (!isInitializedFromSave && inventory.length > 0 && savedState?.boardIds) {
-            const initialized = initializeBoard(tier, savedState.boardIds, inventory);
-            setBoardSync(initialized);
-            setIsInitializedFromSave(true);
-        }
-    }, [inventory, tier, savedState, isInitializedFromSave]);
-
     const [bestTotals, setBestTotals] = useState<Stats>({ Performance: 0, Quality: 0, Efficiency: 0 });
     const [bestPieceStats, setBestPieceStats] = useState<Map<string, Stats>>(new Map());
 
     const [warningMsg, setWarningMsg] = useState<string | null>(null);
     const [solutionCode, setSolutionCode] = useState<string>('');
-
-    const getAvailableInventory = () => {
-        if (!getUsedItems || !machineId) return inventory.filter(i => !i.isLocked);
-        const used = getUsedItems(machineId);
-        return inventory.filter(item => !used.has(item.id) && !item.isLocked);
-    };
-
-    const getInventoryForCode = () => {
-        return inventory;
-    };
 
     const handleTierChange = (newTier: GridTier) => {
         setTier(newTier);
@@ -219,7 +202,8 @@ export function useOptimizer(
             }));
 
             const boardToCalculate = boardChanged ? newBoard : boardRef.current;
-            const availableInventory = getAvailableInventory();
+            const used = getUsedItems(machineId);
+            const availableInventory = inventory.filter(item => !used.has(item.id) && !item.isLocked);
             const { totals, pieceStats } = calculateBoardStats(boardToCalculate, availableInventory, indexInventoryById(availableInventory));
 
             setBestTotals(totals);
@@ -232,7 +216,7 @@ export function useOptimizer(
             }));
 
             if (inventory.length > 0) {
-                const availableForCode = inventoryForCode(getInventoryForCode(), boardToCalculate);
+                const availableForCode = inventoryForCode(inventory, boardToCalculate);
                 setSolutionCode(generateCodeFromState(tier, maximizeStats, targetStats, availableForCode, boardToCalculate));
             } else {
                 setSolutionCode('');

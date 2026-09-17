@@ -3,15 +3,49 @@ import type { Stats, GridTier, InventoryItem, FilterGroup, ItemEffect, ModuleTem
 import { COLOR_MAP, EFFECT_COLORS, EFFECTS_LIST, MODULE_TEMPLATES, NODE_TEMPLATE } from './constants';
 import { formatStatValue, getStatColor, getBaseStats, PRECOMPUTED_OFFSETS } from './utils';
 import { useOptimizer } from './hooks/useOptimizer';
-import { useJointSolve } from './hooks/useJointSolve';
+import { useJointSolve, type MachineHandle } from './hooks/useJointSolve';
 import { isLockedModule } from './solver/locked';
 import { hasObjective, STAT_KEYS } from './solver/objective';
+import type { BoardCell } from './solver/board';
 import MiniShape from './components/MiniShape';
 import SaveFileImporter from './components/SaveFileImporter';
 import BackendSelect from './components/BackendSelect';
 
+type DragTarget = { machineId: string | null; x: number; y: number };
+
+type DragState = {
+    item: InventoryItem;
+    sourceMachineId: string | null;
+    offsets: Point[];
+    dragOffsetX: number;
+    dragOffsetY: number;
+    initialMouseX: number;
+    initialMouseY: number;
+    initialTarget?: DragTarget;
+};
+
+type HoverInfo = { x: number; y: number; cell: InventoryItem; stats?: Stats };
+
+type SizeFilter = 'All' | 3 | 4 | 5;
+
+interface MachineRef extends MachineHandle {
+    clear: () => void;
+    clearIncludingLocked: () => void;
+    place: (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => void;
+    remove: (itemId: string) => void;
+    isValidPlacement: (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => boolean;
+}
+
+const newMachineId = () => `m_${Math.random().toString(36).substring(2, 8)}`;
+
+const readStoredJson = <T,>(key: string): T | null => {
+    const saved = localStorage.getItem(key);
+    if (!saved) return null;
+    try { return JSON.parse(saved); } catch { return null; }
+};
+
 // offload mouse tracking to useRef; performance
-const DragGhost = ({ dragState, cellSize }: { dragState: any, cellSize: number }) => {
+const DragGhost = ({ dragState, cellSize }: { dragState: DragState | null, cellSize: number }) => {
     const ghostRef = useRef<HTMLDivElement>(null);
     const mouse = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
 
@@ -61,7 +95,19 @@ const DragGhost = ({ dragState, cellSize }: { dragState: any, cellSize: number }
     );
 };
 
-const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, updateItemEffectValue, handleBlurEffectValue, onRemove, onDragStart, onToggleInfinite, onToggleLock }: any) => {
+type InventoryItemRowProps = {
+    item: InventoryItem;
+    isAnySolving: boolean;
+    updateItemEffect: (item: InventoryItem, effectIndex: 0 | 1, newEffect: ItemEffect) => void;
+    updateItemEffectValue: (itemId: string, effectIndex: 0 | 1, newValue: number) => void;
+    handleBlurEffectValue: (item: InventoryItem, effectIndex: 0 | 1, rawValue: number) => void;
+    onRemove: (itemId: string) => void;
+    onDragStart: (e: React.MouseEvent, item: InventoryItem) => void;
+    onToggleInfinite: (isInfinite: boolean) => void;
+    onToggleLock: (itemId: string, isLocked: boolean) => void;
+};
+
+const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, updateItemEffectValue, handleBlurEffectValue, onRemove, onDragStart, onToggleInfinite, onToggleLock }: InventoryItemRowProps) => {
     const locked = isLockedModule(item);
     return (
         <div
@@ -116,7 +162,7 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
                                 <input
                                     type="checkbox"
                                     checked={!!item.isInfinite}
-                                    onChange={(e) => onToggleInfinite && onToggleInfinite(e.target.checked)}
+                                    onChange={(e) => onToggleInfinite(e.target.checked)}
                                     disabled={isAnySolving}
                                     style={{ margin: 0, cursor: isAnySolving ? 'not-allowed' : 'pointer' }}
                                 />
@@ -171,9 +217,27 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
     );
 });
 
-type StatRanks = { Performance: number, Quality: number, Efficiency: number };
+type MachineInstanceProps = {
+    machineId: string;
+    inventory: InventoryItem[];
+    setInventory: React.Dispatch<React.SetStateAction<InventoryItem[]>>;
+    getUsedItems: (excludeId?: string | null) => Set<string>;
+    dragState: DragState | null;
+    setHoverInfo: (info: HoverInfo | null) => void;
+    onDuplicate: (machineId: string) => void;
+    onDelete: (machineId: string) => void;
+    cellSize: number;
+    onRun: (machineId: string) => void;
+    onStop: (machineId: string) => void;
+    onBoardCleared: () => void;
+    onBoardChange: (machineId: string, placedIds: string[]) => void;
+    onDragTargetRefChange: (target: DragTarget | null) => void;
+    isAnySolving: boolean;
+    isSolving: boolean;
+    canDelete: boolean;
+};
 
-const MachineInstance = React.memo(forwardRef(({
+const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(({
                                                    machineId,
                                                    inventory,
                                                    setInventory,
@@ -186,11 +250,12 @@ const MachineInstance = React.memo(forwardRef(({
                                                    onRun,
                                                    onStop,
                                                    onBoardCleared,
+                                                   onBoardChange,
                                                    onDragTargetRefChange,
                                                    isAnySolving,
                                                    isSolving,
                                                    canDelete
-                                               }: any, ref) => {
+                                               }, ref) => {
     // Machine state loading handles fallback defaults from localStorage automatically
     const optimizer = useOptimizer(inventory, setInventory, machineId, getUsedItems, 3, isAnySolving);
     const [localHover, setLocalHover] = useState<{x: number, y: number} | null>(null);
@@ -251,14 +316,24 @@ const MachineInstance = React.memo(forwardRef(({
     }), [optimizer, machineState, isMachineLocked]);
 
     useEffect(() => {
-        if (dragState && dragState.sourceMachineId === machineId && dragState.initialTarget && localHover === null) {
-            setLocalHover({ x: dragState.initialTarget.x, y: dragState.initialTarget.y });
-        } else if (!dragState) {
-            setLocalHover(null);
-        }
-    }, [dragState, machineId]);
+        const placed = new Set<string>();
+        for (const row of optimizer.board) for (const cell of row) if (cell && cell !== 'Locked') placed.add(cell.id);
+        onBoardChange(machineId, [...placed]);
+        return () => onBoardChange(machineId, []);
+    }, [optimizer.board, machineId, onBoardChange]);
 
-    const getCellStyles = (x: number, y: number, cell: any): React.CSSProperties => {
+    // A drag picked up from this board starts hovering where the module was; a drag ending hovers nothing
+    const [seenDragState, setSeenDragState] = useState(dragState);
+    if (dragState !== seenDragState) {
+        setSeenDragState(dragState);
+        if (!dragState) {
+            setLocalHover(null);
+        } else if (dragState.sourceMachineId === machineId && dragState.initialTarget && localHover === null) {
+            setLocalHover({ x: dragState.initialTarget.x, y: dragState.initialTarget.y });
+        }
+    }
+
+    const getCellStyles = (x: number, y: number, cell: BoardCell): React.CSSProperties => {
         if (cell === 'Locked') {
             return { backgroundColor: '#111', border: 'none', boxShadow: 'none' };
         }
@@ -421,8 +496,8 @@ const MachineInstance = React.memo(forwardRef(({
                         gridTemplateRows: `repeat(5, ${cellSize}px)`
                     }}
                 >
-                    {optimizer.board.map((row: any, y: number) =>
-                        row.map((cell: any, x: number) => {
+                    {optimizer.board.map((row, y) =>
+                        row.map((cell, x) => {
                             let isPreviewCell = false;
 
                             if (isTargetingThis && previewRootX !== null && previewRootY !== null) {
@@ -595,7 +670,7 @@ const MachineInstance = React.memo(forwardRef(({
                                         <input
                                             type="checkbox"
                                             checked={optimizer.maximizeStats[stat]}
-                                            onChange={() => optimizer.setMaximizeStats((prev: any) => ({ ...prev, [stat]: !prev[stat] }))}
+                                            onChange={() => optimizer.setMaximizeStats(prev => ({ ...prev, [stat]: !prev[stat] }))}
                                             disabled={currentSolving || optimizer.ignoreStats[stat]}
                                             style={{ margin: 0, cursor: (currentSolving || optimizer.ignoreStats[stat]) ? 'not-allowed' : 'pointer' }}
                                         /> Max
@@ -607,11 +682,11 @@ const MachineInstance = React.memo(forwardRef(({
                                         <input
                                             type="checkbox"
                                             checked={optimizer.ignoreStats[stat]}
-                                            onChange={() => optimizer.setIgnoreStats((prev: any) => {
+                                            onChange={() => optimizer.setIgnoreStats(prev => {
                                                 const next = { ...prev, [stat]: !prev[stat] };
                                                 if (next[stat]) {
-                                                    optimizer.setMaximizeStats((m: any) => ({ ...m, [stat]: false }));
-                                                    optimizer.setTargetStats((t: any) => ({ ...t, [stat]: null }));
+                                                    optimizer.setMaximizeStats(m => ({ ...m, [stat]: false }));
+                                                    optimizer.setTargetStats(t => ({ ...t, [stat]: null }));
                                                 }
                                                 return next;
                                             })}
@@ -625,7 +700,7 @@ const MachineInstance = React.memo(forwardRef(({
                                     <input
                                         type="number"
                                         value={optimizer.targetStats[stat] ?? ''}
-                                        onChange={(e) => optimizer.setTargetStats((prev: any) => ({ ...prev, [stat]: e.target.value === '' ? null : Number(e.target.value) }))}
+                                        onChange={(e) => optimizer.setTargetStats(prev => ({ ...prev, [stat]: e.target.value === '' ? null : Number(e.target.value) }))}
                                         disabled={currentSolving || optimizer.ignoreStats[stat]}
                                         style={{ width: '35px', padding: '2px', fontSize: '0.7em', backgroundColor: '#111', color: '#eee', border: '1px solid #444', borderRadius: '3px', textAlign: 'center' }}
                                     />
@@ -636,7 +711,7 @@ const MachineInstance = React.memo(forwardRef(({
                                     <select
                                         title={`Priority for ${stat} — 1 matters most.`}
                                         value={optimizer.statPriority[stat]}
-                                        onChange={(e) => optimizer.setStatPriority((prev: StatRanks) => ({ ...prev, [stat]: Number(e.target.value) }))}
+                                        onChange={(e) => optimizer.setStatPriority(prev => ({ ...prev, [stat]: Number(e.target.value) }))}
                                         disabled={currentSolving || optimizer.ignoreStats[stat]}
                                         style={{ padding: '1px', fontSize: '0.7em', backgroundColor: '#111', color: '#eee', border: '1px solid #444', borderRadius: '3px', cursor: (currentSolving || optimizer.ignoreStats[stat]) ? 'not-allowed' : 'pointer' }}
                                     >
@@ -725,7 +800,7 @@ const MachineInstance = React.memo(forwardRef(({
                         const effStr = effs.length > 0
                             ? ` (${effs.map(e => `${e}${e === 'Learning Algorithm' || e === 'Degrading' ? ` ${mod.effectValues[mod.effects.indexOf(e)]}%` : ''}`).join(', ')})`
                             : '';
-                        const actualPath = (mod as any).originalPath || 'Manual';
+                        const actualPath = mod.originalPath || 'Manual';
 
                         return (
                             <div key={mod.id} style={{ padding: '8px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `3px solid ${COLOR_MAP[mod.color as ModuleColor]}` }}>
@@ -766,77 +841,53 @@ const createInventoryItem = (template: ModuleTemplate): InventoryItem => {
         effects: ['None', 'None'],
         effectValues: [defaultDoubleBase, defaultDoubleBase],
         originalPath: 'Manual'
-    } as any;
+    };
 };
 
 export default function ModuleInventoryUI() {
-    const [inventory, setInventory] = useState<InventoryItem[]>(() => {
-        const savedInventory = localStorage.getItem('optimizer_inventory');
-        if (savedInventory) {
-            try { return JSON.parse(savedInventory); } catch (e) { return []; }
-        }
-        return [];
-    });
+    const [inventory, setInventory] = useState<InventoryItem[]>(() => readStoredJson<InventoryItem[]>('optimizer_inventory') ?? []);
 
     useEffect(() => {
         localStorage.setItem('optimizer_inventory', JSON.stringify(inventory));
     }, [inventory]);
 
-    const [machines, setMachines] = useState<{ id: string }[]>(() => {
-        const saved = localStorage.getItem('optimizer_machine_list');
-        if (saved) {
-            try { return JSON.parse(saved); } catch (e) { }
-        }
-        return [{ id: `m_${Math.random().toString(36).substring(2,8)}` }];
-    });
+    const [machines, setMachines] = useState<{ id: string }[]>(() => readStoredJson<{ id: string }[]>('optimizer_machine_list') ?? [{ id: newMachineId() }]);
 
     useEffect(() => {
         localStorage.setItem('optimizer_machine_list', JSON.stringify(machines));
     }, [machines]);
 
-    const machinesRef = useRef<Record<string, any>>({});
+    const machinesRef = useRef<Record<string, MachineRef>>({});
 
     const getUsedItems = useCallback((excludeId?: string | null) => {
         const used = new Set<string>();
-        Object.entries(machinesRef.current).forEach(([id, m]: [string, any]) => {
+        Object.entries(machinesRef.current).forEach(([id, m]) => {
             if (excludeId && id === excludeId) return;
-            if (m) {
-                const board = m.getBoard();
-                if (board) {
-                    for (let y = 0; y < 5; y++) {
-                        for (let x = 0; x < 7; x++) {
-                            const cell = board[y][x];
-                            if (cell && cell !== 'Locked') used.add(cell.id);
-                        }
-                    }
-                }
-            }
+            for (const row of m.getBoard()) for (const cell of row) if (cell && cell !== 'Locked') used.add(cell.id);
         });
         return used;
     }, []);
 
+    // Each machine reports what sits on its board, so the inventory filters can tell placed modules apart
+    const [placedByMachine, setPlacedByMachine] = useState<Record<string, string[]>>({});
+    const handleBoardChange = useCallback((machineId: string, placedIds: string[]) => {
+        setPlacedByMachine(prev => ({ ...prev, [machineId]: placedIds }));
+    }, []);
+    const allUsedItems = useMemo(() => new Set(Object.values(placedByMachine).flat()), [placedByMachine]);
+
     const [filterGroup, setFilterGroup] = useState<FilterGroup>('All');
-    const [filterSize, setFilterSize] = useState<'All' | 3 | 4 | 5>('All');
+    const [filterSize, setFilterSize] = useState<SizeFilter>('All');
 
     const [invFilterGroup, setInvFilterGroup] = useState<FilterGroup | 'Placed' | 'NotPlaced'>('All');
-    const [invFilterSize, setInvFilterSize] = useState<'All' | 3 | 4 | 5>('All');
+    const [invFilterSize, setInvFilterSize] = useState<SizeFilter>('All');
     const [invFilterEffect, setInvFilterEffect] = useState<ItemEffect | 'All'>('All');
 
-    const [hoverInfo, setHoverInfo] = useState<{ x: number, y: number, cell: InventoryItem, stats?: Stats } | null>(null);
+    const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null);
 
-    const [dragState, setDragState] = useState<{
-        item: InventoryItem;
-        sourceMachineId: string | null;
-        offsets: Point[];
-        dragOffsetX: number;
-        dragOffsetY: number;
-        initialMouseX: number;
-        initialMouseY: number;
-        initialTarget?: any;
-    } | null>(null);
+    const [dragState, setDragState] = useState<DragState | null>(null);
 
-    const dragHoverTargetRef = useRef<{ machineId: string | null, x: number, y: number } | null>(null);
-    const setDragTargetRefChange = useCallback((target: any) => {
+    const dragHoverTargetRef = useRef<DragTarget | null>(null);
+    const setDragTargetRefChange = useCallback((target: DragTarget | null) => {
         dragHoverTargetRef.current = target;
     }, []);
 
@@ -859,23 +910,26 @@ export default function ModuleInventoryUI() {
 
     const jointSolve = useJointSolve(machinesRef, expandedInventory);
     const isAnySolving = jointSolve.solvingIds.size > 0;
-    const runMachine = useCallback((id: string) => jointSolve.start([id]), [jointSolve.start]);
+    const startSolve = jointSolve.start;
+    const runMachine = useCallback((id: string) => startSolve([id]), [startSolve]);
 
     useEffect(() => { dragRef.current = dragState; }, [dragState]);
 
     useEffect(() => {
-        const handleAppDragStart = (e: any) => {
-            setDragState(e.detail);
-            if (e.detail.initialTarget) {
-                dragHoverTargetRef.current = e.detail.initialTarget;
+        const handleAppDragStart = (e: Event) => {
+            const detail = (e as CustomEvent<DragState>).detail;
+            setDragState(detail);
+            if (detail.initialTarget) {
+                dragHoverTargetRef.current = detail.initialTarget;
             }
         };
         window.addEventListener('appDragStart', handleAppDragStart);
         return () => window.removeEventListener('appDragStart', handleAppDragStart);
     }, []);
 
+    const isDragging = dragState !== null;
     useEffect(() => {
-        if (!dragState) return;
+        if (!isDragging) return;
 
         const handleMouseUp = () => {
             const currentDrag = dragRef.current;
@@ -930,7 +984,7 @@ export default function ModuleInventoryUI() {
                 isFlipping = true;
             }
 
-            let rawNewOffsets = currentDrag.offsets.map(transform);
+            const rawNewOffsets = currentDrag.offsets.map(transform);
             let minX = Math.min(...rawNewOffsets.map(p => p.x));
             let minY = Math.min(...rawNewOffsets.map(p => p.y));
             let newOffsets = rawNewOffsets.map(p => ({ x: p.x - minX, y: p.y - minY }));
@@ -998,7 +1052,7 @@ export default function ModuleInventoryUI() {
             window.removeEventListener('mouseup', handleMouseUp);
             window.removeEventListener('keydown', handleKeyDown);
         };
-    }, [!!dragState]);
+    }, [isDragging]);
 
     const addPieceToInventory = (template: ModuleTemplate) => {
         setInventory((prev) => [createInventoryItem(template), ...prev]);
@@ -1104,7 +1158,7 @@ export default function ModuleInventoryUI() {
 
     const handleRemoveItem = useCallback((itemId: string) => {
         setInventory(prev => prev.filter(i => i.id !== itemId));
-        Object.values(machinesRef.current).forEach((m: any) => m?.remove(itemId));
+        Object.values(machinesRef.current).forEach(m => m.remove(itemId));
     }, []);
 
     const handleInventoryDragStart = useCallback((e: React.MouseEvent, item: InventoryItem) => {
@@ -1148,7 +1202,6 @@ export default function ModuleInventoryUI() {
         return !(filterSize !== 'All' && m.size !== filterSize);
     });
 
-    const allUsedItems = getUsedItems(null);
     const filteredInventory = inventory.filter(item => {
         if (invFilterGroup === 'Placed') {
             const isPlaced = allUsedItems.has(item.id) || (item.isInfinite && Array.from(allUsedItems).some(usedId => usedId.startsWith(item.id + '_clone_')));
@@ -1208,7 +1261,7 @@ export default function ModuleInventoryUI() {
             });
             return newMachines.length > 0
                 ? newMachines.map(m => ({ id: m.id }))
-                : [{ id: `m_${Math.random().toString(36).substring(2,8)}` }];
+                : [{ id: newMachineId() }];
         });
 
         machinesRef.current = {};
@@ -1228,25 +1281,21 @@ export default function ModuleInventoryUI() {
     };
 
     const handleClearAll = () => {
-        Object.values(machinesRef.current).forEach((m: any) => {
-            if (m && typeof m.isLocked === 'function' && !m.isLocked()) {
-                m.clear();
-            }
+        Object.values(machinesRef.current).forEach(m => {
+            if (!m.isLocked()) m.clear();
         });
     };
 
     // Emptying the inventory leaves no module to stay locked to a board, so this takes the locked ones off too
     const handleClearInventory = () => {
         setInventory([]);
-        Object.values(machinesRef.current).forEach((m: any) => {
-            if (m && typeof m.isLocked === 'function' && !m.isLocked()) {
-                m.clearIncludingLocked();
-            }
+        Object.values(machinesRef.current).forEach(m => {
+            if (!m.isLocked()) m.clearIncludingLocked();
         });
     };
 
     const handleAddMachine = () => {
-        setMachines(prev => [...prev, { id: `m_${Math.random().toString(36).substring(2,8)}` }]);
+        setMachines(prev => [...prev, { id: newMachineId() }]);
     };
 
     const handleClearAllMachines = () => {
@@ -1264,10 +1313,10 @@ export default function ModuleInventoryUI() {
         });
 
         if (preservedMachines.length === 0) {
-            preservedMachines.push({ id: `m_${Math.random().toString(36).substring(2,8)}` });
+            preservedMachines.push({ id: newMachineId() });
             machinesRef.current = {};
         } else {
-            const nextRefs: Record<string, any> = {};
+            const nextRefs: Record<string, MachineRef> = {};
             preservedMachines.forEach(m => {
                 if (machinesRef.current[m.id]) nextRefs[m.id] = machinesRef.current[m.id];
             });
@@ -1281,7 +1330,7 @@ export default function ModuleInventoryUI() {
     const handleDuplicateMachine = useCallback((machineId: string) => {
         const machine = machinesRef.current[machineId];
         if (!machine) return;
-        const newId = `m_${Math.random().toString(36).substring(2,8)}`;
+        const newId = newMachineId();
         localStorage.setItem(`optimizer_machine_${newId}`, JSON.stringify(machine.getState()));
         const machineType = localStorage.getItem(`optimizer_machine_type_${machineId}`);
         if (machineType) localStorage.setItem(`optimizer_machine_type_${newId}`, machineType);
@@ -1510,7 +1559,7 @@ export default function ModuleInventoryUI() {
                     <MachineInstance
                         key={m.id}
                         machineId={m.id}
-                        ref={(el: any) => { if (el) machinesRef.current[m.id] = el; }}
+                        ref={(el) => { if (el) machinesRef.current[m.id] = el; }}
                         inventory={expandedInventory}
                         setInventory={setInventory}
                         getUsedItems={getUsedItems}
@@ -1522,6 +1571,7 @@ export default function ModuleInventoryUI() {
                         onRun={runMachine}
                         onStop={jointSolve.stop}
                         onBoardCleared={jointSolve.refresh}
+                        onBoardChange={handleBoardChange}
                         onDragTargetRefChange={setDragTargetRefChange}
                         isAnySolving={isAnySolving}
                         isSolving={jointSolve.solvingIds.has(m.id)}
@@ -1602,7 +1652,7 @@ export default function ModuleInventoryUI() {
                             <option value="Efficiency">Efficiency (Green)</option>
                             <option value="Special">Special Modules</option>
                         </select>
-                        <select value={filterSize} onChange={(e) => setFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as any)} style={{ flex: 1, minWidth: '150px', padding: '8px 12px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none' }}>
+                        <select value={filterSize} onChange={(e) => setFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as 3 | 4 | 5)} style={{ flex: 1, minWidth: '150px', padding: '8px 12px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none' }}>
                             <option value="All">All Sizes</option>
                             <option value={3}>Size 3</option>
                             <option value={4}>Size 4</option>
@@ -1680,7 +1730,7 @@ export default function ModuleInventoryUI() {
                             <option value="Efficiency">Efficiency</option>
                             <option value="Special">Special</option>
                         </select>
-                        <select value={invFilterSize} onChange={(e) => setInvFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as any)} style={{ flex: 1, minWidth: '100px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
+                        <select value={invFilterSize} onChange={(e) => setInvFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as 3 | 4 | 5)} style={{ flex: 1, minWidth: '100px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
                             <option value="All">All Sizes</option>
                             <option value={3}>Size 3</option>
                             <option value={4}>Size 4</option>
