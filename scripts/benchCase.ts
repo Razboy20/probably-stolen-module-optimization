@@ -6,9 +6,10 @@ import type { InventoryItem, ItemEffect } from '../src/types';
 /* A seeded synthetic inventory and machines, the same for every backend and runtime the benchmarks compare
  * Case 0 maximizes everything; case 1 holds Performance and Quality to targets the pool meets easily and maximizes the rest;
  * case 2 asks for a Performance near the most the pool can reach (661–753 across seeds 1–4), so the shortfall shapes the whole search
+ * case 3 asks for that Performance at the same priority as maximized Quality and Efficiency, so every point the fill spends on them competes with closing the gap
  * Every machine gets the same configuration and, outside case 0, its own locked square and Blast module already on the board
  */
-export const BENCH_CASES = 3;
+export const BENCH_CASES = 4;
 
 export interface BenchMachine {
     machine: MachineConfig;
@@ -25,12 +26,16 @@ const machineConfig = (id: string, benchCase: number): MachineConfig => benchCas
     maximizeStats: { Performance: false, Quality: true, Efficiency: true },
     ignoreStats: { Performance: false, Quality: false, Efficiency: false },
     statPriority: { Performance: 1, Quality: 2, Efficiency: 3 },
-} : {
+} : benchCase === 2 ? {
     id, tier: 3,
     targetStats: { Performance: 600, Quality: 60, Efficiency: null },
     maximizeStats: { Performance: false, Quality: false, Efficiency: true },
     ignoreStats: { Performance: false, Quality: false, Efficiency: false },
     statPriority: { Performance: 1, Quality: 2, Efficiency: 3 },
+} : {
+    id, tier: 3,
+    targetStats: { Performance: 600, Quality: null, Efficiency: null },
+    maximizeStats: { Performance: false, Quality: true, Efficiency: true },
 };
 
 export const buildBenchCase = (seedValue: number, n: number, benchCase: number, machineCount = 1) => {

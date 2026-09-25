@@ -4,22 +4,33 @@
 # then how often the candidate came out ahead, level or behind at the last checkpoint, with the mean difference on the first tier that differed
 # The search is stochastic, so a change is judged on this table and never on one run
 # MACHINES is passed to both sides; BASE_ENV and CAND_ENV are extra VAR=value settings for one side, so INDEPENDENT=1 or PRESOLVE=1 can be compared to a joint solve of the same checkout
+# JOBS benches run at once (default 4); each is one thread, so keep it at or below the performance cores or the runs slow each other down
 set -e
 base=$1; cand=$2; ms=${3:-3000}
 seeds=${SEEDS:-1 2 3 4 5 6 7 8}
-cases=${CASES:-0 1 2}
+cases=${CASES:-0 1 2 3}
 machines=${MACHINES:-1}
+jobs=${JOBS:-4}
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
 
 run() {
-    (cd "$1" && env $4 SEED=$2 TARGETS=$3 MS=$ms MACHINES=$machines bun scripts/bench.ts 2>/dev/null | tail -1)
+    (cd "$1" && env $4 SEED=$2 TARGETS=$3 MS=$ms MACHINES=$machines bun scripts/bench.ts 2>/dev/null | tail -1) > "$5"
 }
+export -f run
+export ms machines
+
+# macOS xargs drops empty arguments, which would shift every one after it, so an unset side env becomes a harmless assignment
+n=0
+for t in $cases; do for seed in $seeds; do
+    printf '%s\0%s\0%s\0%s\0%s\0' "$base" "$seed" "$t" "${BASE_ENV:-_=}" "$out/$n.a"
+    printf '%s\0%s\0%s\0%s\0%s\0' "$cand" "$seed" "$t" "${CAND_ENV:-_=}" "$out/$n.b"
+    n=$((n + 1))
+done; done > "$out/jobs"
+xargs -0 -n 5 -P "$jobs" bash -c 'run "$@"' _ < "$out/jobs"
 
 results=""
-for t in $cases; do for seed in $seeds; do
-    a=$(run "$base" "$seed" "$t" "$BASE_ENV")
-    b=$(run "$cand" "$seed" "$t" "$CAND_ENV")
-    results+=$(printf '%s\n%s\n' "$a" "$b")$'\n'
-done; done
+for ((i = 0; i < n; i++)); do results+=$(cat "$out/$i.a" "$out/$i.b")$'\n'; done
 
 echo "$results" | bun -e '
     const lines = (await Bun.stdin.text()).trim().split("\n").map(l => JSON.parse(l));
