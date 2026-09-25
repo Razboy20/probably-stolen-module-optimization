@@ -79,6 +79,9 @@ export const tierBoost = (plan: TierPlan, stat: number) =>
  */
 export const TIER_VECTOR_LENGTH = 4;
 export const DENSITY_TIER_WEIGHT = 5;
+// What one point of a stat is worth in its tier: short of a target, and toward a maximized stat
+export const SHORTFALL_WEIGHT = 10000;
+export const MAXIMIZE_WEIGHT = 10;
 
 export const objectiveTiers = (totals: BoardTotals, plan: TierPlan, params: ScoringParams, out: Int32Array) => {
     out.fill(0);
@@ -87,8 +90,8 @@ export const objectiveTiers = (totals: BoardTotals, plan: TierPlan, params: Scor
         const ti = plan.tierOf[s];
         if (ti < 0) continue;
         const t = s === 0 ? totals.p : s === 1 ? totals.q : totals.e;
-        if (params.hasTarget[s] !== 0 && t < params.target[s]) out[ti] -= (params.target[s] - t) * 10000;
-        if (params.maximize[s] !== 0) out[ti] += t * 10;
+        if (params.hasTarget[s] !== 0 && t < params.target[s]) out[ti] -= (params.target[s] - t) * SHORTFALL_WEIGHT;
+        if (params.maximize[s] !== 0) out[ti] += t * MAXIMIZE_WEIGHT;
         else if (params.hasTarget[s] !== 0 && t > params.target[s]) waste += t - params.target[s];
     }
     out[plan.tierCount] -= waste;

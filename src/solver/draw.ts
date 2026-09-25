@@ -1,6 +1,6 @@
 import type { Stats } from '../types';
 import { SHAPE_COUNT } from './geometry';
-import { type MachineConfig, STAT_KEYS, statIsIgnored, type TierPlan, tierBoost } from './objective';
+import { MAXIMIZE_WEIGHT, type MachineConfig, SHORTFALL_WEIGHT, STAT_KEYS, statIsIgnored, type TierPlan, tierBoost } from './objective';
 import { FLAG_WHITE, type PoolTables } from './tables';
 /* What each pool entry is worth to this machine per cell it occupies, used to decide which modules the fill is offered
  * Board space is the scarce resource, so per-cell is the comparison that matters
@@ -15,7 +15,7 @@ import { FLAG_WHITE, type PoolTables } from './tables';
  *
  * The draw only ever asks which of two entries is worth more, so each table holds the rank of the entry's value rather than the value itself
  */
-export const TARGET_MET_DRAW_SCALE = 0.25;
+export const TARGET_MET_DRAW_WEIGHT = 3.75;
 
 // How many random candidates a draw compares before taking the best of them
 // 1 is a uniform draw; higher steers the fill toward high-value modules without ever ruling any out
@@ -89,12 +89,14 @@ export const buildDrawRanks = (tables: PoolTables, drawList: Int32Array, machine
             const key = STAT_KEYS[s];
             if (statIsIgnored(machine, key)) continue;
             let v = 0;
-            if (machine.maximizeStats[key]) v += 10;
+            if (machine.maximizeStats[key]) v += MAXIMIZE_WEIGHT;
             const ti = targeted.indexOf(s);
+            // An unmet target is worth what the objective charges for the shortfall, so modules that close it win the draw over anything a maximized stat of the same tier wants
+            // At the old heuristic weight a Performance module that also costs Efficiency was worth almost nothing, and a reachable target was missed by a few points for lack of being offered
             // Bit set means the target is already met, so the push for it is cut back, but never to nothing
             // The draw decides which modules the fill is even offered,
             // so a stat whose modules stop being drawn cannot be rebuilt when a ruin knocks it below its target, and every repair after that is rejected
-            if (ti !== -1) v += 15 * ((mask & (1 << ti)) !== 0 ? TARGET_MET_DRAW_SCALE : 1);
+            if (ti !== -1) v += (mask & (1 << ti)) !== 0 ? TARGET_MET_DRAW_WEIGHT : SHORTFALL_WEIGHT;
             w[key] = v * tierBoost(plan, s);
         }
         ranks.push(drawValuesFor(tables, drawList, w));
