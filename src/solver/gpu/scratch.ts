@@ -48,6 +48,11 @@ export const removableCount = i32v();
 export const fixedItem = i32s(MAX_PIECES_PER_BOARD);
 export const fixedCellCount = i32s(MAX_PIECES_PER_BOARD);
 export const fixedCells = i32s(MAX_PIECES_PER_BOARD * MAX_PIECE_CELLS);
+// The repack of lifted fixed pieces in ../engine.ts, with its explicit stack of one frame per decided cell
+export const lifted = i32s(MAX_PIECES_PER_BOARD), liftedDown = i32s(MAX_PIECES_PER_BOARD);
+export const liftedCount = i32v(), repackNeed = i32v(), repackDown = i32v(), coveringLifted = i32v();
+export const frameCell = i32s(BOARD_CELLS + 1), framePlacements = i32s(BOARD_CELLS + 1), frameSkip = i32s(BOARD_CELLS + 1);
+export const frameNext = i32s(BOARD_CELLS + 1), frameRotate = i32s(BOARD_CELLS + 1), frameLifted = i32s(BOARD_CELLS + 1), frameEntry = i32s(BOARD_CELLS + 1);
 export const freeCells = i32s(BOARD_CELLS);
 export const freeCount = i32v();
 // The occupied cells of the board being built, matched against the placement masks

@@ -1,9 +1,9 @@
 import tgpu, { d, type TgpuRoot } from 'typegpu';
 import { DRAW_TOURNAMENT, MAX_DRAWS } from '../draw';
-import { FRESH_START_EVERY, STEAL_ONE_IN, WANDER_ONE_IN } from '../engine';
+import { FRESH_START_EVERY, REPACK_STEP_LIMIT, SKIP_FIRST, SKIP_LAST, SKIP_NONE, STEAL_ONE_IN } from '../engine';
 import {
-    BOARD_CELLS, BOARD_H, BOARD_W, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, PLACE_LEFT_COL, PLACE_TOP_ROW, PLACE_TOUCHES_EDGE, PLACE_VALID, SCAN_STRIDES,
-    SHAPE_COUNT
+    BOARD_CELLS, BOARD_H, BOARD_W, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, PLACE_LEFT_COL, PLACE_TOP_ROW, PLACE_TOUCHES_EDGE, PLACE_VALID,
+    SCAN_STRIDES, SHAPE_COUNT
 } from '../geometry';
 import { EMPTY } from '../indexBoard';
 import { DENSITY_TIER_WEIGHT, TIER_VECTOR_LENGTH } from '../objective';
@@ -455,21 +455,11 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         s.freeCount.$ = write;
     };
 
-    const placeBestFit = (item: number, incumbent: number) => {
+    const placeBestFit = (item: number) => {
         'use gpu';
         let bestEntry = -1;
-        let haveScore = incumbent === -1;
         let bestMajor = 0;
         let bestMinor = 0;
-
-        if (incumbent !== -1) {
-            evalPlacement(incumbent, item);
-            if (s.scoreOk.$ !== 0) {
-                haveScore = true;
-                bestMajor = s.scoreMajor.$; bestMinor = s.scoreMinor.$;
-                bestEntry = incumbent;
-            }
-        }
 
         const orientStart = pool.$[item].orientStart;
         const orientEnd = orientStart + pool.$[item].orientCount;
@@ -480,8 +470,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
                 if ((geometry.$[GEO_META + entry] & PLACE_VALID) === 0) continue;
                 evalPlacement(entry, item);
                 if (s.scoreOk.$ === 0) continue;
-                if (!haveScore || s.scoreMajor.$ > bestMajor || (s.scoreMajor.$ === bestMajor && s.scoreMinor.$ > bestMinor)) {
-                    haveScore = true;
+                if (s.scoreMajor.$ > bestMajor || (s.scoreMajor.$ === bestMajor && s.scoreMinor.$ > bestMinor)) {
                     bestMajor = s.scoreMajor.$; bestMinor = s.scoreMinor.$;
                     bestEntry = entry;
                 }
@@ -500,37 +489,6 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         s.occLo.$ = s.occLo.$ | geometry.$[GEO_MASK_LO + entry];
         s.occHi.$ = s.occHi.$ | geometry.$[GEO_MASK_HI + entry];
         compactFreeCells();
-    };
-
-    const placementIsOpen = (entry: number) => {
-        'use gpu';
-        if ((geometry.$[GEO_META + entry] & PLACE_VALID) === 0) return false;
-        return ((geometry.$[GEO_MASK_LO + entry] & s.occLo.$) | (geometry.$[GEO_MASK_HI + entry] & s.occHi.$)) === 0;
-    };
-
-    // A uniformly random open placement; the piece's own cells are free, so there is always at least one
-    const placeAnywhere = (item: number) => {
-        'use gpu';
-        const orientStart = pool.$[item].orientStart;
-        const orientEnd = orientStart + pool.$[item].orientCount;
-        let open = 0;
-        for (let c = 0; c < s.freeCount.$; c++) {
-            for (let g = orientStart; g < orientEnd; g++) {
-                if (placementIsOpen(g * BOARD_CELLS + s.freeCells.$[c])) open = open + 1;
-            }
-        }
-        let pick = rngBelow(open);
-        for (let c = 0; c < s.freeCount.$; c++) {
-            for (let g = orientStart; g < orientEnd; g++) {
-                const entry = g * BOARD_CELLS + s.freeCells.$[c];
-                if (!placementIsOpen(entry)) continue;
-                if (pick === 0) {
-                    commitPlacement(entry, item);
-                    return;
-                }
-                pick = pick - 1;
-            }
-        }
     };
 
     // The shift test of shapeFitsFree in ../geometry.ts, so the draw never has to offer a module of a shape with nowhere to go
@@ -554,24 +512,6 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         return false;
     };
 
-    const homeEntryOf = (fixed: number) => {
-        'use gpu';
-        const item = s.fixedItem.$[fixed];
-        const cellCount = s.fixedCellCount.$[fixed];
-        const anchor = s.fixedCells.$[fixed * MAX_PIECE_CELLS];
-        const orientEnd = pool.$[item].orientStart + pool.$[item].orientCount;
-        for (let g = pool.$[item].orientStart; g < orientEnd; g++) {
-            const entry = g * BOARD_CELLS + anchor;
-            if ((geometry.$[GEO_META + entry] & PLACE_VALID) === 0 || geometry.$[GEO_CELL_COUNT + entry] !== cellCount) continue;
-            let matches = true;
-            for (let i = 0; i < cellCount; i++) {
-                if (s.fixedCells.$[fixed * MAX_PIECE_CELLS + i] !== geometry.$[GEO_CELLS + entry * MAX_PIECE_CELLS + i]) { matches = false; break; }
-            }
-            if (matches) return entry;
-        }
-        return d.i32(-1);
-    };
-
     const shuffleRemovable = (count: number) => {
         'use gpu';
         for (let i = count - 1; i > 0; i--) {
@@ -582,7 +522,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         }
     };
 
-    // Returns how many fixed pieces the board holds, after recording the removable ones in blocked and removable
+    // Returns how many fixed pieces the board holds; every piece, fixed or not, is recorded in blocked and removable
     const scanBoard = () => {
         'use gpu';
         s.removableCount.$ = 0;
@@ -600,7 +540,6 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
                 }
                 s.fixedCells.$[f * MAX_PIECE_CELLS + s.fixedCellCount.$[f]] = i;
                 s.fixedCellCount.$[f] = s.fixedCellCount.$[f] + 1;
-                continue;
             }
             if (!s.bitIsSet(item)) {
                 s.setBit(item);
@@ -629,7 +568,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
 
             for (let i = 0; i < BOARD_CELLS; i++) {
                 const item = s.test.$[i];
-                if (item >= 0 && (pool.$[item].flags & FLAG_FIXED) === 0 && !s.bitIsSet(item)) s.test.$[i] = EMPTY;
+                if (item >= 0 && !s.bitIsSet(item)) s.test.$[i] = EMPTY;
             }
         }
 
@@ -698,25 +637,185 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         s.freeCount.$ = n;
     };
 
-    const relocateFixed = (fixedCount: number) => {
+    const cellTaken = (idx: number) => {
         'use gpu';
-        let wander = false;
-        if (fixedCount > 0 && rngBelow(WANDER_ONE_IN) === 0) wander = true;
-        for (let f = 0; f < fixedCount; f++) {
-            const home = homeEntryOf(f);
-            for (let c = 0; c < s.fixedCellCount.$[f]; c++) {
-                const idx = s.fixedCells.$[f * MAX_PIECE_CELLS + c];
-                s.test.$[idx] = EMPTY;
-                if (idx < 32) s.occLo.$ = s.occLo.$ & ~s.bit32(idx);
-                else s.occHi.$ = s.occHi.$ & ~s.bit32(idx - 32);
-                s.freeCells.$[s.freeCount.$] = idx;
-                s.freeCount.$ = s.freeCount.$ + 1;
+        if (idx < 32) return (s.occLo.$ & s.bit32(idx)) !== 0;
+        return (s.occHi.$ & s.bit32(idx - 32)) !== 0;
+    };
+
+    const markCell = (idx: number) => {
+        'use gpu';
+        if (idx < 32) s.occLo.$ = s.occLo.$ | s.bit32(idx);
+        else s.occHi.$ = s.occHi.$ | s.bit32(idx - 32);
+    };
+
+    const unmarkCell = (idx: number) => {
+        'use gpu';
+        if (idx < 32) s.occLo.$ = s.occLo.$ & ~s.bit32(idx);
+        else s.occHi.$ = s.occHi.$ & ~s.bit32(idx - 32);
+    };
+
+    // The repack of lifted fixed pieces in ../engine.ts, its recursion unrolled onto the frame arrays
+    const coveringEntry = (g: number, i: number, cell: number) => {
+        'use gpu';
+        const anchor = cell - geometry.$[GEO_ORIENT_OFFSETS + g * MAX_PIECE_CELLS + i] + geometry.$[GEO_ORIENT_OFFSETS + g * MAX_PIECE_CELLS];
+        if (anchor < 0) return d.i32(-1);
+        const entry = g * BOARD_CELLS + anchor;
+        if ((geometry.$[GEO_META + entry] & PLACE_VALID) === 0 || geometry.$[GEO_CELLS + entry * MAX_PIECE_CELLS + i] !== cell) return d.i32(-1);
+        if (((geometry.$[GEO_MASK_LO + entry] & s.occLo.$) | (geometry.$[GEO_MASK_HI + entry] & s.occHi.$)) !== 0) return d.i32(-1);
+        return entry;
+    };
+
+    const coveringPlacement = (cell: number, n: number) => {
+        'use gpu';
+        let count = 0;
+        for (let j = 0; j < s.liftedCount.$; j++) {
+            if (s.liftedDown.$[j] !== 0) continue;
+            const item = s.fixedItem.$[s.lifted.$[j]];
+            const orientEnd = pool.$[item].orientStart + pool.$[item].orientCount;
+            for (let g = pool.$[item].orientStart; g < orientEnd; g++) {
+                const cellCount = geometry.$[GEO_ORIENT_CELL_COUNT + g];
+                for (let i = 0; i < cellCount; i++) {
+                    const entry = coveringEntry(g, i, cell);
+                    if (entry === -1) continue;
+                    if (count === n) {
+                        s.coveringLifted.$ = j;
+                        return entry;
+                    }
+                    count = count + 1;
+                }
             }
-            if (wander) placeAnywhere(s.fixedItem.$[f]);
-            else placeBestFit(s.fixedItem.$[f], home);
-            s.boardIsEmpty.$ = 0;
-            if (s.mNeedsTotals.$ !== 0) refreshFillTotals();
         }
+        if (n === -1) return count;
+        return d.i32(-1);
+    };
+
+    const openFrame = (f: number) => {
+        'use gpu';
+        let open = 0;
+        s.frameCell.$[f] = -1;
+        for (let c = 0; c < s.freeCount.$; c++) {
+            if (cellTaken(s.freeCells.$[c])) continue;
+            if (open === 0) s.frameCell.$[f] = s.freeCells.$[c];
+            open = open + 1;
+        }
+        const slack = open - s.repackNeed.$;
+        s.frameNext.$[f] = 0;
+        s.framePlacements.$[f] = 0;
+        s.frameSkip.$[f] = SKIP_NONE;
+        if (s.frameCell.$[f] === -1 || slack < 0) return;
+        s.framePlacements.$[f] = coveringPlacement(s.frameCell.$[f], -1);
+        s.frameRotate.$[f] = 0;
+        if (s.framePlacements.$[f] > 0) s.frameRotate.$[f] = rngBelow(s.framePlacements.$[f]);
+        if (slack > 0) {
+            s.frameSkip.$[f] = SKIP_LAST;
+            if (rngBelow(open) < slack) s.frameSkip.$[f] = SKIP_FIRST;
+        }
+    };
+
+    const frameChoices = (f: number) => {
+        'use gpu';
+        if (s.frameSkip.$[f] === SKIP_NONE) return s.framePlacements.$[f];
+        return s.framePlacements.$[f] + 1;
+    };
+
+    const applyChoice = (f: number, choice: number) => {
+        'use gpu';
+        let skipAt = -1;
+        let shift = 0;
+        if (s.frameSkip.$[f] === SKIP_FIRST) {
+            skipAt = 0;
+            shift = 1;
+        }
+        if (s.frameSkip.$[f] === SKIP_LAST) skipAt = s.framePlacements.$[f];
+        if (choice === skipAt) {
+            markCell(s.frameCell.$[f]);
+            s.frameLifted.$[f] = -1;
+            return;
+        }
+        const n = (s.frameRotate.$[f] + choice - shift) % s.framePlacements.$[f];
+        const entry = coveringPlacement(s.frameCell.$[f], n);
+        const j = s.coveringLifted.$;
+        const item = s.fixedItem.$[s.lifted.$[j]];
+        const cellCount = geometry.$[GEO_CELL_COUNT + entry];
+        for (let i = 0; i < cellCount; i++) s.test.$[geometry.$[GEO_CELLS + entry * MAX_PIECE_CELLS + i]] = item;
+        s.occLo.$ = s.occLo.$ | geometry.$[GEO_MASK_LO + entry];
+        s.occHi.$ = s.occHi.$ | geometry.$[GEO_MASK_HI + entry];
+        s.liftedDown.$[j] = 1;
+        s.repackDown.$ = s.repackDown.$ + 1;
+        s.repackNeed.$ = s.repackNeed.$ - cellCount;
+        s.frameLifted.$[f] = j;
+        s.frameEntry.$[f] = entry;
+    };
+
+    const undoChoice = (f: number) => {
+        'use gpu';
+        const j = s.frameLifted.$[f];
+        if (j === -1) {
+            unmarkCell(s.frameCell.$[f]);
+            return;
+        }
+        const entry = s.frameEntry.$[f];
+        const cellCount = geometry.$[GEO_CELL_COUNT + entry];
+        for (let i = 0; i < cellCount; i++) s.test.$[geometry.$[GEO_CELLS + entry * MAX_PIECE_CELLS + i]] = EMPTY;
+        s.occLo.$ = s.occLo.$ & ~geometry.$[GEO_MASK_LO + entry];
+        s.occHi.$ = s.occHi.$ & ~geometry.$[GEO_MASK_HI + entry];
+        s.liftedDown.$[j] = 0;
+        s.repackDown.$ = s.repackDown.$ - 1;
+        s.repackNeed.$ = s.repackNeed.$ + cellCount;
+    };
+
+    const repackLifted = () => {
+        'use gpu';
+        s.repackNeed.$ = 0;
+        s.repackDown.$ = 0;
+        for (let j = 0; j < s.liftedCount.$; j++) {
+            s.liftedDown.$[j] = 0;
+            s.repackNeed.$ = s.repackNeed.$ + s.fixedCellCount.$[s.lifted.$[j]];
+        }
+        let depth = 0;
+        let steps = 0;
+        openFrame(0);
+        while (s.repackDown.$ < s.liftedCount.$ && depth >= 0 && steps < REPACK_STEP_LIMIT) {
+            if (s.frameNext.$[depth] >= frameChoices(depth)) {
+                depth = depth - 1;
+                if (depth >= 0) undoChoice(depth);
+                continue;
+            }
+            const choice = s.frameNext.$[depth];
+            s.frameNext.$[depth] = choice + 1;
+            applyChoice(depth, choice);
+            steps = steps + 1;
+            depth = depth + 1;
+            if (s.repackDown.$ < s.liftedCount.$) openFrame(depth);
+        }
+        const found = s.repackDown.$ === s.liftedCount.$;
+        for (let f = depth - 1; f >= 0; f--) {
+            if (!found || s.frameLifted.$[f] === -1) undoChoice(f);
+        }
+        if (!found) {
+            for (let j = 0; j < s.liftedCount.$; j++) {
+                const fixed = s.lifted.$[j];
+                for (let c = 0; c < s.fixedCellCount.$[fixed]; c++) {
+                    const idx = s.fixedCells.$[fixed * MAX_PIECE_CELLS + c];
+                    s.test.$[idx] = s.fixedItem.$[fixed];
+                    markCell(idx);
+                }
+            }
+        }
+        compactFreeCells();
+    };
+
+    // The fixed pieces the ruin lifted go back down before the draw
+    const repackFixed = (fixedCount: number) => {
+        'use gpu';
+        s.liftedCount.$ = 0;
+        for (let f = 0; f < fixedCount; f++) {
+            if (s.bitIsSet(s.fixedItem.$[f])) continue;
+            s.lifted.$[s.liftedCount.$] = f;
+            s.liftedCount.$ = s.liftedCount.$ + 1;
+        }
+        if (s.liftedCount.$ > 0) repackLifted();
     };
 
     const metTargetMask = () => {
@@ -802,7 +901,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
             const item = aux.$[s.mDrawListOffset.$ + pos];
             const shape = pool.$[item].shape;
 
-            if (placeBestFit(item, -1)) {
+            if (placeBestFit(item)) {
                 s.setBit(item);
                 s.shapeBlocked.$[shape] = s.shapeBlocked.$[shape] + 1;
                 s.boardIsEmpty.$ = 0;
@@ -931,12 +1030,12 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         const fixedCount = scanBoard();
         ruin(isStagnant);
         collectFreeCells();
+        repackFixed(fixedCount);
         s.boardIsEmpty.$ = 0;
         if (s.freeCount.$ === s.mOpenCellCount.$) s.boardIsEmpty.$ = 1;
 
         s.fillP.$ = 0; s.fillQ.$ = 0; s.fillE.$ = 0;
         if (s.mNeedsTotals.$ !== 0) refreshFillTotals();
-        relocateFixed(fixedCount);
         fill();
 
         scoreBuilt();

@@ -2,8 +2,8 @@ import { type BoardTotals, boardTotals } from './boardTotals';
 import { DRAW_TOURNAMENT, MAX_DRAWS } from './draw';
 import { evalPlacement, type PlaceScore } from './evalPlacement';
 import {
-    BOARD_CELLS, cellMaskHi, cellMaskLo, MAX_PIECE_CELLS, PLACE_CELL_COUNT, PLACE_CELLS, PLACE_MASK_HI, PLACE_MASK_LO, PLACE_META, PLACE_VALID,
-    placeEntry, SCAN_STRIDES, SHAPE_COUNT, shapeFitsFree
+    BOARD_CELLS, cellMaskHi, cellMaskLo, MAX_PIECE_CELLS, ORIENT_CELL_COUNT, ORIENT_OFFSETS, PLACE_CELL_COUNT, PLACE_CELLS, PLACE_MASK_HI,
+    PLACE_MASK_LO, PLACE_META, PLACE_VALID, placeEntry, SCAN_STRIDES, SHAPE_COUNT, shapeFitsFree
 } from './geometry';
 import { EMPTY } from './indexBoard';
 import { addMachineTiers, compareTiers, objectiveTiers, TIER_VECTOR_LENGTH } from './objective';
@@ -30,11 +30,13 @@ export const STAGNATION_LIMIT = 150;
  */
 export const STEAL_ONE_IN = 4;
 
-/* One iteration in so many drops the board's fixed pieces at random free placements instead of their best fit, and lets acceptance judge the result
- * A fixed piece's own score says nothing about what it costs the others: an Alarm across the top row scores the same as one anywhere else, while the
- * Top Mount modules that wanted that row do not. The best fit alone leaves it wherever the user put it
- */
-export const WANDER_ONE_IN = 4;
+// How many choices the repack of lifted fixed pieces may try before it gives up and puts them back where they were
+// Every open cell is one decision, so a search that finds a layout at all finds it well inside this
+export const REPACK_STEP_LIMIT = 1024;
+// Where a repack decision tries leaving its cell empty: not at all, after every placement, or before them
+export const SKIP_NONE = 0;
+export const SKIP_LAST = 1;
+export const SKIP_FIRST = 2;
 
 // Unbiased Fisher-Yates over the first `count` entries
 // `sort(() => Math.random() - 0.5)` is not a shuffle: it leaves the ordering strongly correlated with the input, which narrows the range of layouts the solver actually explores
@@ -145,8 +147,7 @@ export const runOptimizationEngine = async (
     // Movable pieces on the other boards that this board's layout can draw, with the board each one stands on
     const stealable = new Int32Array(MAX_PIECES_PER_BOARD * machineCount);
     const stealableOwner = new Int8Array(MAX_PIECES_PER_BOARD * machineCount);
-    // Every special or locked piece sitting on the rebuilt board, with the cells it is currently standing on
-    // They stay put until the fill lifts them one at a time, so the board is never in a state where one is missing
+    // Every special or locked piece sitting on the rebuilt board, with the cells it is standing on, which is where a failed repack puts it back
     const fixedItem = new Int32Array(MAX_PIECES_PER_BOARD);
     const fixedCellCount = new Int32Array(MAX_PIECES_PER_BOARD);
     const fixedCells = new Int32Array(MAX_PIECES_PER_BOARD * MAX_PIECE_CELLS);
@@ -217,28 +218,10 @@ export const runOptimizationEngine = async (
         return pick;
     };
 
-    /* Commits one piece at its best-scoring placement among the free cells, and reports whether it found one
-     * The pool fill and the special-module relocation both go through here on purpose:
-     * a special is only allowed to move because the fill can judge where it should go, and it has to judge it on exactly the terms it judges everything else
-     *
-     * `incumbent` is the placement the piece is standing in already, for a piece being relocated rather than placed for the first time
-     * It is scored ahead of everything else and the scan only takes a strictly better cell, so a piece with nowhere better to be simply stays
-     * Without it the ties decide, and for a module whose score barely varies across the board (which is every special) that means the first cell in scan order:
-     * a Line4 lands in the top-left of whatever the ruin opened up, every iteration, taking the best space on the board from the modules that would have earned something with it
-     */
-    const placeBestFit = (item: number, boardIsEmpty: boolean, incumbent: number) => {
+    // Commits one piece at its best-scoring placement among the free cells, and reports whether it found one
+    const placeBestFit = (item: number, boardIsEmpty: boolean) => {
         let bestEntry = -1;
-        let haveScore = incumbent === -1;
         let bestMajor = 0, bestMinor = 0;
-
-        if (incumbent !== -1) {
-            evalPlacement(tables, incumbent, item, testBoard, occupiedLo, occupiedHi, boardIsEmpty, params, fillTotals.p, fillTotals.q, fillTotals.e, score);
-            if (score.ok) {
-                haveScore = true;
-                bestMajor = score.major; bestMinor = score.minor;
-                bestEntry = incumbent;
-            }
-        }
 
         const orientStart = tables.orientStart[item];
         const orientEnd = orientStart + tables.orientCount[item];
@@ -251,8 +234,7 @@ export const runOptimizationEngine = async (
 
                 evalPlacement(tables, entry, item, testBoard, occupiedLo, occupiedHi, boardIsEmpty, params, fillTotals.p, fillTotals.q, fillTotals.e, score);
                 if (!score.ok) continue;
-                if (!haveScore || score.major > bestMajor || (score.major === bestMajor && score.minor > bestMinor)) {
-                    haveScore = true;
+                if (score.major > bestMajor || (score.major === bestMajor && score.minor > bestMinor)) {
                     bestMajor = score.major; bestMinor = score.minor;
                     bestEntry = entry;
                 }
@@ -272,45 +254,162 @@ export const runOptimizationEngine = async (
         compactFreeCells();
     };
 
-    const placementIsOpen = (entry: number) =>
-        (PLACE_META[entry] & PLACE_VALID) !== 0 && ((PLACE_MASK_LO[entry] & occupiedLo) | (PLACE_MASK_HI[entry] & occupiedHi)) === 0;
+    /* The fixed pieces the ruin lifted go back down before anything is drawn, all of them, and never anywhere they would leave another without room
+     * A search over the open cells in scan order decides each in turn: covered by a placement of a lifted piece that has not gone down yet, or left empty
+     * Leaving a cell empty is only allowed while there are more open cells than the pieces still to place need, and is tried first as often as cells will end up empty,
+     * so the pieces land anywhere in the ruined area rather than packed into the first cells of the scan
+     * The layout they were lifted from is always among the answers, so a search that runs out of steps puts them back there
+     *
+     * Lifting and repacking together is what lets fixed pieces trade places: one at a time, a piece on a full board only ever sees its own cells
+     */
+    const lifted = new Int32Array(MAX_PIECES_PER_BOARD);
+    const liftedDown = new Uint8Array(MAX_PIECES_PER_BOARD);
+    let liftedCount = 0;
+    // One frame per decided cell: the cell, how many placements cover it, where leaving it empty sits among its choices (SKIP_*),
+    // which choice to try next, the random rotation the placements are tried in, and what was done there (a lifted index and its placement, or -1 for left empty)
+    const frameCell = new Int32Array(BOARD_CELLS + 1);
+    const framePlacements = new Int32Array(BOARD_CELLS + 1);
+    const frameSkip = new Uint8Array(BOARD_CELLS + 1);
+    const frameNext = new Int32Array(BOARD_CELLS + 1);
+    const frameRotate = new Int32Array(BOARD_CELLS + 1);
+    const frameLifted = new Int32Array(BOARD_CELLS + 1);
+    const frameEntry = new Int32Array(BOARD_CELLS + 1);
+    let repackNeed = 0;
+    let repackDown = 0;
+    // Which lifted piece the placement coveringPlacement last returned belongs to
+    let coveringLifted = 0;
 
-    // A uniformly random open placement; the piece's own cells are free, so there is always at least one
-    const placeAnywhere = (item: number) => {
-        const orientStart = tables.orientStart[item];
-        const orientEnd = orientStart + tables.orientCount[item];
-        let open = 0;
-        for (let c = 0; c < freeCount; c++) {
-            for (let g = orientStart; g < orientEnd; g++) if (placementIsOpen(placeEntry(g, freeCells[c]))) open++;
-        }
-        let pick = rngBelow(rng, open);
-        for (let c = 0; c < freeCount; c++) {
-            for (let g = orientStart; g < orientEnd; g++) {
-                const entry = placeEntry(g, freeCells[c]);
-                if (!placementIsOpen(entry)) continue;
-                if (pick === 0) { commitPlacement(entry, item); return; }
-                pick--;
-            }
-        }
+    const cellTaken = (cell: number) => ((occupiedLo & cellMaskLo(cell)) | (occupiedHi & cellMaskHi(cell))) !== 0;
+
+    // The placement of orientation g whose i-th cell is `cell`, or -1 when it is off the board or runs into something
+    const coveringEntry = (g: number, i: number, cell: number) => {
+        const anchor = cell - ORIENT_OFFSETS[g * MAX_PIECE_CELLS + i] + ORIENT_OFFSETS[g * MAX_PIECE_CELLS];
+        if (anchor < 0) return -1;
+        const entry = placeEntry(g, anchor);
+        if ((PLACE_META[entry] & PLACE_VALID) === 0 || PLACE_CELLS[entry * MAX_PIECE_CELLS + i] !== cell) return -1;
+        if (((PLACE_MASK_LO[entry] & occupiedLo) | (PLACE_MASK_HI[entry] & occupiedHi)) !== 0) return -1;
+        return entry;
     };
 
-    // The cells were collected in row-major order, and an orientation's cells are in that same order and anchored on its first cell,
-    // so the cells the piece is standing on say which placement it is standing in
-    const homeEntryOf = (fixed: number) => {
-        const item = fixedItem[fixed];
-        const cellCount = fixedCellCount[fixed];
-        const anchor = fixedCells[fixed * MAX_PIECE_CELLS];
-        const orientEnd = tables.orientStart[item] + tables.orientCount[item];
-        for (let g = tables.orientStart[item]; g < orientEnd; g++) {
-            const entry = placeEntry(g, anchor);
-            if ((PLACE_META[entry] & PLACE_VALID) === 0 || PLACE_CELL_COUNT[entry] !== cellCount) continue;
-            let matches = true;
-            for (let i = 0; i < cellCount; i++) {
-                if (fixedCells[fixed * MAX_PIECE_CELLS + i] !== PLACE_CELLS[entry * MAX_PIECE_CELLS + i]) { matches = false; break; }
+    // The n-th placement covering `cell` among the lifted pieces still up, its piece left in coveringLifted; with n = -1, how many there are
+    const coveringPlacement = (cell: number, n: number) => {
+        let count = 0;
+        for (let j = 0; j < liftedCount; j++) {
+            if (liftedDown[j] !== 0) continue;
+            const item = fixedItem[lifted[j]];
+            const orientEnd = tables.orientStart[item] + tables.orientCount[item];
+            for (let g = tables.orientStart[item]; g < orientEnd; g++) {
+                for (let i = 0; i < ORIENT_CELL_COUNT[g]; i++) {
+                    const entry = coveringEntry(g, i, cell);
+                    if (entry === -1) continue;
+                    if (count === n) {
+                        coveringLifted = j;
+                        return entry;
+                    }
+                    count++;
+                }
             }
-            if (matches) return entry;
         }
-        return -1;
+        return n === -1 ? count : -1;
+    };
+
+    // The first open cell in scan order becomes frame d's decision; a frame with no choices is a dead end
+    const openFrame = (d: number) => {
+        let open = 0;
+        frameCell[d] = -1;
+        for (let c = 0; c < freeCount; c++) {
+            if (cellTaken(freeCells[c])) continue;
+            if (open === 0) frameCell[d] = freeCells[c];
+            open++;
+        }
+        const slack = open - repackNeed;
+        frameNext[d] = 0;
+        framePlacements[d] = 0;
+        frameSkip[d] = SKIP_NONE;
+        if (frameCell[d] === -1 || slack < 0) return;
+        framePlacements[d] = coveringPlacement(frameCell[d], -1);
+        frameRotate[d] = framePlacements[d] > 0 ? rngBelow(rng, framePlacements[d]) : 0;
+        if (slack > 0) frameSkip[d] = rngBelow(rng, open) < slack ? SKIP_FIRST : SKIP_LAST;
+    };
+
+    const frameChoices = (d: number) => framePlacements[d] + (frameSkip[d] === SKIP_NONE ? 0 : 1);
+
+    const applyChoice = (d: number, choice: number) => {
+        const skipAt = frameSkip[d] === SKIP_FIRST ? 0 : frameSkip[d] === SKIP_LAST ? framePlacements[d] : -1;
+        if (choice === skipAt) {
+            occupiedLo |= cellMaskLo(frameCell[d]);
+            occupiedHi |= cellMaskHi(frameCell[d]);
+            frameLifted[d] = -1;
+            return;
+        }
+        const n = (frameRotate[d] + choice - (frameSkip[d] === SKIP_FIRST ? 1 : 0)) % framePlacements[d];
+        const entry = coveringPlacement(frameCell[d], n);
+        const j = coveringLifted;
+        const item = fixedItem[lifted[j]];
+        for (let i = 0; i < PLACE_CELL_COUNT[entry]; i++) testBoard[PLACE_CELLS[entry * MAX_PIECE_CELLS + i]] = item;
+        occupiedLo |= PLACE_MASK_LO[entry];
+        occupiedHi |= PLACE_MASK_HI[entry];
+        liftedDown[j] = 1;
+        repackDown++;
+        repackNeed -= PLACE_CELL_COUNT[entry];
+        frameLifted[d] = j;
+        frameEntry[d] = entry;
+    };
+
+    const undoChoice = (d: number) => {
+        const j = frameLifted[d];
+        if (j === -1) {
+            occupiedLo &= ~cellMaskLo(frameCell[d]);
+            occupiedHi &= ~cellMaskHi(frameCell[d]);
+            return;
+        }
+        const entry = frameEntry[d];
+        for (let i = 0; i < PLACE_CELL_COUNT[entry]; i++) testBoard[PLACE_CELLS[entry * MAX_PIECE_CELLS + i]] = EMPTY;
+        occupiedLo &= ~PLACE_MASK_LO[entry];
+        occupiedHi &= ~PLACE_MASK_HI[entry];
+        liftedDown[j] = 0;
+        repackDown--;
+        repackNeed += PLACE_CELL_COUNT[entry];
+    };
+
+    // Cells left empty were only marked taken for the search; they are free for the fill again
+    const repackLifted = () => {
+        repackNeed = 0;
+        repackDown = 0;
+        for (let j = 0; j < liftedCount; j++) {
+            liftedDown[j] = 0;
+            repackNeed += fixedCellCount[lifted[j]];
+        }
+        let depth = 0;
+        let steps = 0;
+        openFrame(0);
+        while (repackDown < liftedCount && depth >= 0 && steps < REPACK_STEP_LIMIT) {
+            if (frameNext[depth] >= frameChoices(depth)) {
+                depth--;
+                if (depth >= 0) undoChoice(depth);
+                continue;
+            }
+            applyChoice(depth, frameNext[depth]++);
+            steps++;
+            depth++;
+            if (repackDown < liftedCount) openFrame(depth);
+        }
+        const found = repackDown === liftedCount;
+        for (let d = depth - 1; d >= 0; d--) {
+            if (!found || frameLifted[d] === -1) undoChoice(d);
+        }
+        if (!found) {
+            for (let j = 0; j < liftedCount; j++) {
+                const f = lifted[j];
+                for (let c = 0; c < fixedCellCount[f]; c++) {
+                    const idx = fixedCells[f * MAX_PIECE_CELLS + c];
+                    testBoard[idx] = fixedItem[f];
+                    occupiedLo |= cellMaskLo(idx);
+                    occupiedHi |= cellMaskHi(idx);
+                }
+            }
+        }
+        compactFreeCells();
     };
 
     // Every module on another board of the set is out of this board's reach, and counts against its shape like a kept piece here would
@@ -397,16 +496,13 @@ export const runOptimizationEngine = async (
             offered = -1;
             if (stealableCount > 0 && !isStagnant && rngBelow(rng, STEAL_ONE_IN) === 0) offerForSteal(stealableCount);
 
+            // Fixed pieces take their share of the ruin like any other, and the ones it lifts are repacked instead of left to the draw
             let removableCount = 0;
             let fixedCount = 0;
             for (let i = 0; i < BOARD_CELLS; i++) {
                 const item = testBoard[i];
                 if (item < 0) continue;
 
-                /* A special is offered a better cell every iteration instead of taking a share of the ruin's removal budget
-                 * It is not the ruin's kind of move: the ruin takes a piece away and lets the fill find something better to do with the space,
-                 * and a special is going straight back down whatever happens. Spending a removal on one only means one fewer real piece is reconsidered that iteration
-                 */
                 if ((tables.flags[item] & FLAG_FIXED) !== 0) {
                     let f = 0;
                     while (f < fixedCount && fixedItem[f] !== item) f++;
@@ -416,7 +512,6 @@ export const runOptimizationEngine = async (
                         fixedCount++;
                     }
                     fixedCells[f * MAX_PIECE_CELLS + fixedCellCount[f]++] = i;
-                    continue;
                 }
 
                 if (!bitIsSet(blocked, item)) {
@@ -437,7 +532,7 @@ export const runOptimizationEngine = async (
 
                 for (let i = 0; i < BOARD_CELLS; i++) {
                     const item = testBoard[i];
-                    if (item >= 0 && (tables.flags[item] & FLAG_FIXED) === 0 && !bitIsSet(blocked, item)) testBoard[i] = EMPTY;
+                    if (item >= 0 && !bitIsSet(blocked, item)) testBoard[i] = EMPTY;
                 }
             }
 
@@ -462,33 +557,13 @@ export const runOptimizationEngine = async (
                     occupiedHi |= cellMaskHi(i);
                 }
             }
+            liftedCount = 0;
+            for (let f = 0; f < fixedCount; f++) if (!bitIsSet(blocked, fixedItem[f])) lifted[liftedCount++] = f;
+            if (liftedCount > 0) repackLifted();
             let boardIsEmpty = freeCount === openCellCount;
 
             if (needsTotals) boardTotals(tables, testBoard, fillTotals);
             else fillTotals.p = fillTotals.q = fillTotals.e = 0;
-
-            /* The board's specials, offered a better cell one at a time and before anything is drawn
-             *
-             * One at a time is what makes this safe: at the moment a special is placed its own cells are still free, and an anchor-normalised orientation always has an
-             * anchor among them, so placeBestFit can never come back empty-handed and a special can never be lost on the way. Lifting them all at once would let the
-             * first one take the second one's cells and leave the second with nowhere guaranteed to go
-             * Going before the draw also means they choose out of the whole ruined area rather than whatever the fill leaves over
-             */
-            const wander = fixedCount > 0 && rngBelow(rng, WANDER_ONE_IN) === 0;
-            for (let f = 0; f < fixedCount; f++) {
-                const home = homeEntryOf(f);
-                for (let c = 0; c < fixedCellCount[f]; c++) {
-                    const idx = fixedCells[f * MAX_PIECE_CELLS + c];
-                    testBoard[idx] = EMPTY;
-                    occupiedLo &= ~cellMaskLo(idx);
-                    occupiedHi &= ~cellMaskHi(idx);
-                    freeCells[freeCount++] = idx;
-                }
-                if (wander) placeAnywhere(fixedItem[f]);
-                else placeBestFit(fixedItem[f], boardIsEmpty, home);
-                boardIsEmpty = false;
-                if (needsTotals) boardTotals(tables, testBoard, fillTotals);
-            }
 
             let infeasibleShapes = infeasibleShapesNow(0);
 
@@ -510,7 +585,7 @@ export const runOptimizationEngine = async (
                 const item = drawList[pos];
                 const shape = tables.shape[item];
 
-                if (!placeBestFit(item, boardIsEmpty, -1)) {
+                if (!placeBestFit(item, boardIsEmpty)) {
                     infeasibleShapes |= 1 << shape;
                 } else {
                     setBit(blocked, item);
