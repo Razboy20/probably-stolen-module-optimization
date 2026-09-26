@@ -23,8 +23,9 @@ export interface GpuTables {
     params: ParamsValue;
 }
 
+// A machine with nothing left to draw still has its locked pieces to rearrange, so an empty draw list is no reason to turn the GPU down
 export const fitsGpu = (setup: SolveSetup) =>
-    setup.machines.length <= MAX_MACHINES && setup.tables.count <= MAX_ITEMS && setup.machines.some(m => m.draw.drawList.length > 0);
+    setup.machines.length <= MAX_MACHINES && setup.tables.count <= MAX_ITEMS;
 
 const buildPool = (setup: SolveSetup): PoolEntryValue[] => {
     const t = setup.tables;

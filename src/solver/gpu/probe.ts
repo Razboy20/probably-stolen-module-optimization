@@ -14,3 +14,7 @@ export const gpuMayWork = () => {
 export const markGpuFailed = () => {
     if (typeof localStorage !== 'undefined') localStorage.setItem(FAILURE_KEY, String(Date.now()));
 };
+
+export const clearGpuFailed = () => {
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(FAILURE_KEY);
+};

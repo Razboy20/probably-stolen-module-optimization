@@ -1,6 +1,6 @@
 import { runOptimizationEngine, type SolveRequest } from './engine';
-import { runGpuPopulation } from './gpu/population';
-import { gpuMayWork, gpuSupported, markGpuFailed } from './gpu/probe';
+import { GpuUnusableError, runGpuPopulation } from './gpu/population';
+import { clearGpuFailed, gpuMayWork, gpuSupported, markGpuFailed } from './gpu/probe';
 import type { SolverHandle, UpdateHandler } from './handle';
 import { compareTiers } from './objective';
 import { randomSeed } from './rng';
@@ -129,7 +129,10 @@ const runOnGpu = (request: SolveRequest, onUpdate: UpdateHandler, parallelism?: 
     gpuLeased = true;
     const gate = recordGate(onUpdate);
     const gpu = runGpuPopulation(request, gate, parallelism);
-    const done = gpu.done.catch(error => { markGpuFailed(); throw error; }).finally(() => { gpuLeased = false; });
+    const done = gpu.done
+        .then(result => { clearGpuFailed(); return result; })
+        .catch(error => { if (error instanceof GpuUnusableError) markGpuFailed(); throw error; })
+        .finally(() => { gpuLeased = false; });
     return withFallback({ stop: gpu.stop, done }, () => runOnCpu(request, gate, 'population'));
 };
 

@@ -16,9 +16,26 @@ const SLOW_DISPATCH_MS = 250;
 const MIGRATE_EVERY = 16;
 const MIGRATE_FRACTION = 4;
 
+/* The device or the kernel on it cannot work here, which a retry would only run into again
+ * Anything else (a solve too large for the tables, a failing update handler, a lost device) says nothing about the next solve
+ */
+export class GpuUnusableError extends Error {}
+
+const unusable = async <T>(what: string, work: () => T | Promise<T>) => {
+    try {
+        return await work();
+    } catch (error) {
+        throw new GpuUnusableError(`${what}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
+};
+
+// A lost device is dropped, so the next solve starts on a fresh one instead of failing against the dead one
 let rootPromise: Promise<TgpuRoot> | null = null;
 const acquireRoot = () => {
-    rootPromise ??= tgpu.init().catch(error => {
+    rootPromise ??= unusable('WebGPU unavailable', () => tgpu.init()).then(root => {
+        void root.device.lost.then(() => { rootPromise = null; });
+        return root;
+    }, error => {
         rootPromise = null;
         throw error;
     });
@@ -62,7 +79,7 @@ const validated = async <T>(device: GPUDevice, work: () => Promise<T>) => {
     device.pushErrorScope('validation');
     const result = await work();
     const error = await device.popErrorScope();
-    if (error) throw new Error(`WebGPU validation failed: ${error.message}`);
+    if (error) throw new GpuUnusableError(`WebGPU validation failed: ${error.message}`);
     return result;
 };
 
@@ -78,12 +95,16 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
         const setup = prepareSolve(request);
         if (!fitsGpu(setup)) throw new Error(`Solve does not fit the GPU tables: ${setup.machines.length} machines, ${setup.tables.count} modules`);
         const seed = request.seed ?? randomSeed();
-        const kernel: SearchKernel = createSearchKernel(root, setup, seed, threads);
+        const { kernel, search, extract, migrate } = await unusable('GPU kernel failed to build', () => {
+            const kernel: SearchKernel = createSearchKernel(root, setup, seed, threads);
+            return {
+                kernel,
+                search: root.createComputePipeline({ compute: kernel.searchStep }),
+                extract: root.createComputePipeline({ compute: kernel.extractChampion }),
+                migrate: root.createComputePipeline({ compute: kernel.migrate })
+            };
+        });
         const params = { ...kernel.tables.params, threadCount: threads, itersPerDispatch: 1 };
-
-        const search = root.createComputePipeline({ compute: kernel.searchStep });
-        const extract = root.createComputePipeline({ compute: kernel.extractChampion });
-        const migrate = root.createComputePipeline({ compute: kernel.migrate });
         const workgroups = Math.ceil(threads / WORKGROUP_SIZE);
 
         let lost = false;
