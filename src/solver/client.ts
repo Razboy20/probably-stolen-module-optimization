@@ -8,13 +8,12 @@ import type { WorkerRequest, WorkerResponse } from './worker';
 
 export type { SolverHandle } from './handle';
 
-export type SolverBackend = 'auto' | 'gpu' | 'population' | 'workers' | 'inline';
+// inline is what the app falls back to without workers, and what the headless scripts run; it is never worth choosing in the menu
+export type SolverBackend = 'auto' | 'gpu' | 'population' | 'inline';
 export const SOLVER_BACKENDS: { value: SolverBackend; label: string }[] = [
     { value: 'auto', label: 'Auto' },
     { value: 'gpu', label: 'GPU' },
     { value: 'population', label: 'All cores' },
-    { value: 'workers', label: 'One worker' },
-    { value: 'inline', label: 'Main thread' },
 ];
 
 const BACKEND_STORAGE_KEY = 'optimizer_backend';
@@ -114,13 +113,12 @@ const resolveBackend = (preference: SolverBackend): Exclude<SolverBackend, 'auto
     if (preference === 'inline') return 'inline';
     if (preference === 'gpu') return gpuSupported() && !gpuLeased ? 'gpu' : 'population';
     if (preference === 'auto' && gpuMayWork() && !gpuLeased) return 'gpu';
-    if (!workersAvailable()) return 'inline';
-    return preference === 'auto' ? 'population' : preference;
+    return workersAvailable() ? 'population' : 'inline';
 };
 
-const runOnCpu = (request: SolveRequest, onUpdate: UpdateHandler, backend: 'population' | 'workers', workers?: number): SolverHandle => {
+const runOnCpu = (request: SolveRequest, onUpdate: UpdateHandler, workers?: number): SolverHandle => {
     if (!workersAvailable()) return runInline(request, onUpdate);
-    const size = backend === 'population' ? workers ?? Math.max(1, coreCount() - 1) : 1;
+    const size = workers ?? Math.max(1, coreCount() - 1);
     return size > 1 ? runPopulation(request, onUpdate, size) : runInWorker(request, onUpdate);
 };
 
@@ -133,7 +131,7 @@ const runOnGpu = (request: SolveRequest, onUpdate: UpdateHandler, parallelism?: 
         .then(result => { clearGpuFailed(); return result; })
         .catch(error => { if (error instanceof GpuUnusableError) markGpuFailed(); throw error; })
         .finally(() => { gpuLeased = false; });
-    return withFallback({ stop: gpu.stop, done }, () => runOnCpu(request, gate, 'population'));
+    return withFallback({ stop: gpu.stop, done }, () => runOnCpu(request, gate));
 };
 
 // parallelism overrides the worker count or GPU thread count, for benchmarks
@@ -144,7 +142,7 @@ export const runSolver = (
     if (backend === 'gpu') return runOnGpu(request, onUpdate, parallelism);
     if (backend !== 'inline') {
         try {
-            return runOnCpu(request, onUpdate, backend, parallelism);
+            return runOnCpu(request, onUpdate, parallelism);
         } catch (error) {
             console.warn('Solver worker unavailable, running on the main thread', error);
         }
