@@ -112,7 +112,7 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
     return (
         <div
             onMouseDown={(e) => onDragStart(e, item)}
-            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `4px solid ${COLOR_MAP[item.color as ModuleColor]}`, cursor: (isAnySolving || locked) ? 'default' : 'grab', opacity: locked ? 0.6 : 1 }}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `4px solid ${COLOR_MAP[item.color as ModuleColor]}`, cursor: isAnySolving ? 'default' : 'grab' }}
         >
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', width: '100%' }}>
                 <MiniShape shape={item.shape} colorHex={COLOR_MAP[item.color as ModuleColor]} size="10px" />
@@ -178,7 +178,7 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
                     onMouseDown={(e) => e.stopPropagation()}
                     onClick={() => onToggleLock(item.id, !locked)}
                     disabled={isAnySolving}
-                    title="A locked module stays on its machine; the optimizer only moves it around that board"
+                    title="The optimizer never adds, removes or moves a locked module to another machine, only rearranges it on its board; you can place it anywhere"
                     style={{
                         background: locked ? 'rgba(255, 77, 77, 0.1)' : 'transparent',
                         border: `1px solid ${locked ? '#ff4d4d' : '#555'}`,
@@ -937,15 +937,13 @@ export default function ModuleInventoryUI() {
 
             if (currentDrag) {
                 if (!currentTarget || currentTarget.machineId === null) {
-                    if (currentDrag.sourceMachineId !== null && !isLockedModule(currentDrag.item)) {
+                    if (currentDrag.sourceMachineId !== null) {
                         machinesRef.current[currentDrag.sourceMachineId]?.remove(currentDrag.item.id);
                     }
                 } else {
                     const machine = machinesRef.current[currentTarget.machineId];
 
-                    if (isLockedModule(currentDrag.item) && currentDrag.sourceMachineId !== currentTarget.machineId) {
-                        // A locked module stays on its machine
-                    } else if (machine) {
+                    if (machine) {
                         const targetX = currentTarget.x - currentDrag.dragOffsetX;
                         const targetY = currentTarget.y - currentDrag.dragOffsetY;
 
@@ -1162,7 +1160,7 @@ export default function ModuleInventoryUI() {
     }, []);
 
     const handleInventoryDragStart = useCallback((e: React.MouseEvent, item: InventoryItem) => {
-        if (isAnySolving || isLockedModule(item)) { e.preventDefault(); return; }
+        if (isAnySolving) { e.preventDefault(); return; }
         e.preventDefault();
         const offsets = PRECOMPUTED_OFFSETS.get(item.shape)?.[0] || [{x: 0, y: 0}];
 
