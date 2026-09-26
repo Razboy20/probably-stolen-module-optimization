@@ -1,10 +1,14 @@
 import type { GridTier, InventoryItem, ItemEffect, ModuleColor, ModuleShape, Stats, TargetStats } from '../types';
 import { getBaseStats } from '../utils';
-import { MODULE_TEMPLATES } from '../constants';
+import { MODULE_TEMPLATES, NODE_TEMPLATE } from '../constants';
 import { type Board, initializeBoard } from './board';
+import { isLockedModule } from './locked';
 
 const SHAPE_MAP: ModuleShape[] = ['Node1x2', 'L3', 'L4_Base', 'T4_Base', 'Square4_Base', 'L4_High', 'T4_High', 'Square4_High', 'P5', 'C5', 'Line4'];
 const COLOR_MAP_KEYS: ModuleColor[] = ['White', 'Red', 'Yellow', 'Green', 'Purple', 'DarkRed', 'Grey'];
+// Blast and Junk Processing furnaces are both grey Line4s, so Blast takes the one colour index the three bits leave unused
+const BLAST_COLOR_INDEX = 7;
+const BLAST_NAME = 'Furnace Module (Blast)';
 const EFFECT_MAP: ItemEffect[] = ['None', 'Premium', 'Inferior', 'Overcharged', 'Degrading', 'Negative Feedback', 'Receiver', 'Side Mount', 'Top Mount', 'Learning Algorithm'];
 
 const BASE85_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
@@ -74,6 +78,10 @@ class BitReader {
         this.bytes = decodeBase85(base85);
     }
 
+    hasBits(numBits: number) {
+        return (this.bytes.length - this.bytePos) * 8 - (7 - this.bitPos) >= numBits;
+    }
+
     read(numBits: number): number {
         let value = 0;
         for (let i = 0; i < numBits; i++) {
@@ -138,7 +146,7 @@ export const generateCodeFromState = (
 
     inv.forEach(item => {
         writer.write(SHAPE_MAP.indexOf(item.shape), 4);
-        writer.write(COLOR_MAP_KEYS.indexOf(item.color), 3);
+        writer.write(item.displayName === BLAST_NAME ? BLAST_COLOR_INDEX : COLOR_MAP_KEYS.indexOf(item.color), 3);
 
         const positions = placedItemsMap.get(item.id) || [];
         writer.write(positions.length, 3);
@@ -160,6 +168,10 @@ export const generateCodeFromState = (
             }
         });
     });
+
+    // Lock state trails the modules behind a set marker bit, so older decoders never read it and older codes, padded with zeros, read as having none
+    writer.write(1, 1);
+    inv.forEach(item => writer.write(isLockedModule(item) ? 1 : 0, 1));
 
     return writer.toBase85();
 };
@@ -205,18 +217,23 @@ export const decodeSolution = (code: string): DecodedSolution => {
     for (let i = 0; i < numModules; i++) {
         const shapeIdx = reader.read(4);
         const colorIdx = reader.read(3);
+        const isBlast = shapeIdx === SHAPE_MAP.indexOf('Line4') && colorIdx === BLAST_COLOR_INDEX;
         const shape = SHAPE_MAP[shapeIdx];
-        const color = COLOR_MAP_KEYS[colorIdx];
+        const color = isBlast ? 'Grey' : COLOR_MAP_KEYS[colorIdx];
+        if (shape === undefined || color === undefined) throw new Error('Invalid module');
 
         const posCount = reader.read(3);
         const positions: number[] = [];
         for (let p = 0; p < posCount; p++) positions.push(reader.read(6));
+        if (positions.some(pos => pos >= 35 || board[Math.floor(pos / 7)][pos % 7] === 'Locked')) throw new Error('Invalid position');
 
-        const template = shape === 'Node1x2' ? { displayName: 'Node' } : MODULE_TEMPLATES.find(m => m.shape === shape && m.color === color) || { displayName: 'Unknown Module' };
+        const template = shape === 'Node1x2' ? NODE_TEMPLATE
+            : isBlast ? { displayName: BLAST_NAME }
+            : MODULE_TEMPLATES.find(m => m.shape === shape && m.color === color) || { displayName: 'Unknown Module' };
         const reconstructedEffects: [ItemEffect, ItemEffect] = ['None', 'None'];
         const base = getBaseStats({ shape, color, displayName: template.displayName });
-        const maxBaseValue = Math.max(Math.abs(base.Performance), Math.abs(base.Quality), Math.abs(base.Efficiency));
-        const reconstructedValues: [number, number] = [maxBaseValue * 2, maxBaseValue * 2];
+        const maxPositiveBase = Math.max(base.Performance, base.Quality, base.Efficiency, 0);
+        const reconstructedValues: [number, number] = [maxPositiveBase * 2, maxPositiveBase * 2];
 
         for (let eIdx = 0; eIdx < 2; eIdx++) {
             const hasEffect = reader.read(1) === 1;
@@ -235,6 +252,10 @@ export const decodeSolution = (code: string): DecodedSolution => {
         const newItem: InventoryItem = { id: `${shape}_${color}_${Math.random().toString(36).substring(2, 8)}`, shape, color, displayName: template.displayName, effects: reconstructedEffects, effectValues: reconstructedValues };
         inventory.push(newItem);
         positions.forEach((pos: number) => board[Math.floor(pos / 7)][pos % 7] = newItem);
+    }
+
+    if (reader.hasBits(1 + numModules) && reader.read(1) === 1) {
+        for (const item of inventory) item.isLocked = reader.read(1) === 1;
     }
 
     return { tier, maximizeStats, targetStats, inventory, board };
