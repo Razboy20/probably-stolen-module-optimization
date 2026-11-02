@@ -5,6 +5,8 @@ import type { ScoringParams } from './scoring';
 export type MachineConfig = {
     id: string;
     tier: GridTier;
+    // Absent means the machine takes any module
+    machineType?: string;
     targetStats: TargetStats;
     maximizeStats: Record<keyof Stats, boolean>;
     ignoreStats?: Partial<Record<keyof Stats, boolean>>;

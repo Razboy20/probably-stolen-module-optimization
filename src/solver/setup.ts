@@ -8,6 +8,7 @@ import { activeRankOrder, buildTierPlan, type MachineConfig, STAT_KEYS, statIsIg
 import { buildSearchPool } from './pool';
 import { buildScoringParams, MAX_TARGET, type ScoringParams } from './scoring';
 import { buildPoolTables, type PoolTables } from './tables';
+import { isModuleAllowedInMachine } from '../utils';
 
 export interface MachineRequest {
     machine: MachineConfig;
@@ -59,7 +60,10 @@ const targetCap = (machineCount: number) => Math.min(MAX_TARGET, Math.floor(2 **
 
 const prepareMachine = (tables: PoolTables, searchPoolInventory: InventoryItem[], { machine, initialBoard }: MachineRequest, cap: number, rankOrder: number[]): MachineSetup => {
     // Boards may already hold modules the search itself would not pick up, so the pruned pool is only used for choosing what to place
-    const searchPool = buildSearchPool(searchPoolInventory, tables.internal, machine).filter(item => tables.indexOf.has(item.id));
+    // A module made for other machines is never drawn here, but a board of its own kind in the set may still take it
+    const { machineType } = machine;
+    const allowedInventory = machineType === undefined ? searchPoolInventory : searchPoolInventory.filter(item => isModuleAllowedInMachine(item, machineType));
+    const searchPool = buildSearchPool(allowedInventory, tables.internal, machine).filter(item => tables.indexOf.has(item.id));
     const draw = layoutDraw(tables, Int32Array.from(searchPool, item => tables.indexOf.get(item.id)!));
 
     const plan = buildTierPlan(machine, rankOrder);

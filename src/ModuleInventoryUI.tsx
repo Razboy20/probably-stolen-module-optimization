@@ -294,11 +294,12 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
     const currentSolving: boolean = isSolving;
     const machineState = useMemo(() => ({
         tier: optimizer.tier,
+        machineType: optimizer.machineType,
         maximizeStats: optimizer.maximizeStats,
         targetStats: optimizer.targetStats,
         ignoreStats: optimizer.ignoreStats,
         statPriority: optimizer.statPriority
-    }), [optimizer.tier, optimizer.maximizeStats, optimizer.targetStats, optimizer.ignoreStats, optimizer.statPriority]);
+    }), [optimizer.tier, optimizer.machineType, optimizer.maximizeStats, optimizer.targetStats, optimizer.ignoreStats, optimizer.statPriority]);
     const canRun = currentSolving || (inventory.length > 0 && hasObjective(machineState));
 
     const machineType = optimizer.machineType || 'Select Machine...';
