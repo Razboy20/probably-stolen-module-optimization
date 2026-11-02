@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, forwardRef, useImperativeHandle, useCallback, useMemo } from 'react';
 import type { Stats, GridTier, InventoryItem, FilterGroup, ItemEffect, ModuleTemplate, ModuleColor, Point } from './types';
-import { COLOR_MAP, EFFECT_COLORS, EFFECTS_LIST, MODULE_TEMPLATES, NODE_TEMPLATE } from './constants';
-import { formatStatValue, getStatColor, getBaseStats, PRECOMPUTED_OFFSETS } from './utils';
+import { COLOR_MAP, EFFECT_COLORS, EFFECTS_LIST, MACHINE_GROUP_ORDER, MODULE_TEMPLATES, NODE_TEMPLATE, getGridSize } from './constants';
+import { applyInternalEffects, compareTemplatesByMachine, formatStatValue, getStatColor, getBaseStats, getModuleTemplate, isFixedStatModule, PRECOMPUTED_OFFSETS } from './utils';
 import { useOptimizer } from './hooks/useOptimizer';
 import { useJointSolve, type MachineHandle } from './hooks/useJointSolve';
 import { isLockedModule } from './solver/locked';
@@ -26,7 +26,18 @@ type DragState = {
 
 type HoverInfo = { x: number; y: number; cell: InventoryItem; stats?: Stats };
 
-type SizeFilter = 'All' | 3 | 4 | 5;
+type SizeFilter = 'All' | 2 | 3 | 4 | 5;
+
+const MACHINE_TYPE_OPTIONS = ['Moisture Farm', 'Furnace', 'Water Purifier', 'Alarm System', 'AgeWell', 'Cryptographic Desequencer', 'Mirage Projector', 'Evaporator', 'Hydroponic System', '3D Printer', 'DNA Manipulator'];
+const MACHINE_FILTER_OPTIONS = MACHINE_GROUP_ORDER.filter(name => MODULE_TEMPLATES.some(t => t.allowedMachines?.includes(name)));
+
+const STAT_ABBREVIATIONS: Record<keyof Stats, string> = { Performance: 'Perf', Quality: 'Qual', Efficiency: 'Eff' };
+
+const matchesMachineFilter = (allowedMachines: string[] | undefined, filter: string) => {
+    if (filter === 'All') return true;
+    if (filter === 'None') return !allowedMachines?.length;
+    return !!allowedMachines?.includes(filter);
+};
 
 interface MachineRef extends MachineHandle {
     clear: () => void;
@@ -34,6 +45,7 @@ interface MachineRef extends MachineHandle {
     place: (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => void;
     remove: (itemId: string) => void;
     isValidPlacement: (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => boolean;
+    checkModuleAllowed: (item: InventoryItem) => boolean;
 }
 
 const newMachineId = () => `m_${Math.random().toString(36).substring(2, 8)}`;
@@ -109,10 +121,12 @@ type InventoryItemRowProps = {
 
 const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, updateItemEffectValue, handleBlurEffectValue, onRemove, onDragStart, onToggleInfinite, onToggleLock }: InventoryItemRowProps) => {
     const locked = isLockedModule(item);
+    const fixedBase = isFixedStatModule(item) ? getBaseStats(item) : null;
+    const shownStats = item.color !== 'White' ? (fixedBase ?? applyInternalEffects(item)) : null;
     return (
         <div
             onMouseDown={(e) => onDragStart(e, item)}
-            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `4px solid ${COLOR_MAP[item.color as ModuleColor]}`, cursor: isAnySolving ? 'default' : 'grab' }}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `4px solid ${COLOR_MAP[item.color as ModuleColor]}`, cursor: isAnySolving || item.isStuck ? 'default' : 'grab' }}
         >
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', width: '100%' }}>
                 <MiniShape shape={item.shape} colorHex={COLOR_MAP[item.color as ModuleColor]} size="10px" />
@@ -120,7 +134,18 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
                 <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: '4px', pointerEvents: 'none' }}>
                     <span style={{ fontSize: '0.9em', fontWeight: 'bold', color: '#eee' }}>{item.displayName}</span>
 
-                    {item.shape !== 'Node1x2' ? (
+                    {shownStats && (
+                        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', fontSize: '0.75em', fontWeight: 'bold' }}>
+                            {STAT_KEYS.map(stat => shownStats[stat] !== 0 && (
+                                <span key={stat} style={{ color: getStatColor(shownStats[stat]) }}>
+                                    {STAT_ABBREVIATIONS[stat]} {formatStatValue(shownStats[stat])}
+                                </span>
+                            ))}
+                            {STAT_KEYS.every(stat => shownStats[stat] === 0) && <span style={{ color: '#888' }}>No stat changes</span>}
+                        </div>
+                    )}
+
+                    {fixedBase ? null : item.color !== 'White' ? (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '100%', pointerEvents: 'auto' }}>
                             {[0, 1].map((effectIdx) => {
                                 const currentEffect = item.effects[effectIdx];
@@ -177,8 +202,8 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
                 <button
                     onMouseDown={(e) => e.stopPropagation()}
                     onClick={() => onToggleLock(item.id, !locked)}
-                    disabled={isAnySolving}
-                    title="The optimizer never adds, removes or moves a locked module to another machine, only rearranges it on its board; you can place it anywhere"
+                    disabled={isAnySolving || item.isStuck}
+                    title={item.isStuck ? 'A stuck module cannot be moved or unlocked' : 'The optimizer never adds, removes or moves a locked module to another machine, only rearranges it on its board; you can place it anywhere'}
                     style={{
                         background: locked ? 'rgba(255, 77, 77, 0.1)' : 'transparent',
                         border: `1px solid ${locked ? '#ff4d4d' : '#555'}`,
@@ -191,7 +216,7 @@ const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, upd
                         minWidth: '60px'
                     }}
                 >
-                    {locked ? 'Unlock' : 'Lock'}
+                    {item.isStuck ? 'Stuck' : locked ? 'Unlock' : 'Lock'}
                 </button>
                 <button
                     onMouseDown={(e) => e.stopPropagation()}
@@ -276,16 +301,8 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
     }), [optimizer.tier, optimizer.maximizeStats, optimizer.targetStats, optimizer.ignoreStats, optimizer.statPriority]);
     const canRun = currentSolving || (inventory.length > 0 && hasObjective(machineState));
 
-    // Automatically load the machine name from save file
-    const [machineType, setMachineType] = useState(() => {
-        return localStorage.getItem(`optimizer_machine_type_${machineId}`) || 'Select Machine...';
-    });
-
-    useEffect(() => {
-        if (machineType !== 'Select Machine...') {
-            localStorage.setItem(`optimizer_machine_type_${machineId}`, machineType);
-        }
-    }, [machineType, machineId]);
+    const machineType = optimizer.machineType || 'Select Machine...';
+    const gridSize = getGridSize(optimizer.isEvaporator);
 
     useEffect(() => {
         localStorage.setItem(`optimizer_machine_locked_${machineId}`, String(isMachineLocked));
@@ -311,6 +328,7 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
         remove: optimizer.manuallyRemoveItem,
         getState: () => machineState,
         isValidPlacement: optimizer.isValidPlacement,
+        checkModuleAllowed: optimizer.checkModuleAllowed,
         getBoard: () => optimizer.boardRef.current,
         isLocked: () => isMachineLocked
     }), [optimizer, machineState, isMachineLocked]);
@@ -358,6 +376,12 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
         const bgImages: string[] = [];
         const bgPositions: string[] = [];
         const bgSizes: string[] = [];
+
+        if (cell.isStuck) {
+            bgImages.push('repeating-linear-gradient(45deg, rgba(0, 0, 0, 0.4), rgba(0, 0, 0, 0.4) 10px, transparent 10px, transparent 20px)');
+            bgPositions.push('0 0');
+            bgSizes.push('100% 100%');
+        }
 
         if (isSame(x + 1, y) && isSame(x, y + 1) && !isSame(x + 1, y + 1)) {
             bgImages.push('linear-gradient(90deg, #000, #000)');
@@ -492,12 +516,12 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
                         }
                     }}
                     style={{
-                        gridTemplateColumns: `repeat(7, ${cellSize}px)`,
-                        gridTemplateRows: `repeat(5, ${cellSize}px)`
+                        gridTemplateColumns: `repeat(${gridSize.cols}, ${cellSize}px)`,
+                        gridTemplateRows: `repeat(${gridSize.rows}, ${cellSize}px)`
                     }}
                 >
-                    {optimizer.board.map((row, y) =>
-                        row.map((cell, x) => {
+                    {optimizer.board.slice(0, gridSize.rows).map((row, y) =>
+                        row.slice(0, gridSize.cols).map((cell, x) => {
                             let isPreviewCell = false;
 
                             if (isTargetingThis && previewRootX !== null && previewRootY !== null) {
@@ -521,7 +545,7 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
                                     }}
                                     onMouseLeave={() => setHoverInfo(null)}
                                     onMouseDown={(e) => {
-                                        if (isAnySolving || !cell || cell === 'Locked') return;
+                                        if (isAnySolving || !cell || cell === 'Locked' || cell.isStuck) return;
                                         e.preventDefault();
                                         const footprint = getBoardFootprint(cell.id);
                                         if (!footprint) return;
@@ -576,7 +600,7 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
                                         height: `${cellSize}px`,
                                         ...getCellStyles(x, y, cell),
                                         opacity: isBeingDragged ? 0.3 : 1,
-                                        cursor: cell && cell !== 'Locked' ? (isAnySolving ? 'not-allowed' : 'grab') : 'default',
+                                        cursor: cell && cell !== 'Locked' && !cell.isStuck ? (isAnySolving ? 'not-allowed' : 'grab') : 'default',
                                         boxSizing: 'border-box',
                                         position: 'relative'
                                     }}
@@ -626,7 +650,7 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
                                     }
                                 }
                             });
-                            setMachineType(`${selected} ${max + 1}`);
+                            optimizer.updateMachineType(`${selected} ${max + 1}`);
                         }}
                         disabled={currentSolving}
                         style={{
@@ -637,29 +661,25 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
                         }}
                     >
                         <option value="Select Machine..." disabled>Select Machine...</option>
-                        {machineType !== "Select Machine..." && !["Moisture Farm", "Furnace", "Water Purifier", "Alarm System", "AgeWell", "Cryptographic Desequencer", "Mirage Projector"].includes(machineType) && (
+                        {machineType !== "Select Machine..." && !MACHINE_TYPE_OPTIONS.includes(machineType) && (
                             <option value={machineType}>
                                 {machineType.length > 45 ? '...' + machineType.substring(machineType.length - 42) : machineType}
                             </option>
                         )}
-                        <option value="Moisture Farm">Moisture Farm</option>
-                        <option value="Furnace">Furnace</option>
-                        <option value="Water Purifier">Water Purifier</option>
-                        <option value="Alarm System">Alarm System</option>
-                        <option value="AgeWell">AgeWell</option>
-                        <option value="Cryptographic Desequencer">Cryptographic Desequencer</option>
-                        <option value="Mirage Projector">Mirage Projector</option>
+                        {MACHINE_TYPE_OPTIONS.map(name => <option key={name} value={name}>{name}</option>)}
                     </select>
 
-                    <div style={{ display: 'flex', justifyContent: 'center' }}>
-                        <div style={{ display: 'flex', gap: '5px', backgroundColor: '#222', padding: '5px', borderRadius: '6px' }}>
-                            {[1, 2, 3].map((t) => (
-                                <button key={t} onClick={() => optimizer.handleTierChange(t as GridTier)} disabled={currentSolving} style={{ padding: '6px 12px', fontSize: '0.85em', backgroundColor: optimizer.tier === t ? '#555' : 'transparent', color: 'white', border: 'none', borderRadius: '4px', cursor: currentSolving ? 'not-allowed' : 'pointer' }}>
-                                    Tier {t}
-                                </button>
-                            ))}
+                    {!optimizer.isEvaporator && (
+                        <div style={{ display: 'flex', justifyContent: 'center' }}>
+                            <div style={{ display: 'flex', gap: '5px', backgroundColor: '#222', padding: '5px', borderRadius: '6px' }}>
+                                {[1, 2, 3].map((t) => (
+                                    <button key={t} onClick={() => optimizer.handleTierChange(t as GridTier)} disabled={currentSolving} style={{ padding: '6px 12px', fontSize: '0.85em', backgroundColor: optimizer.tier === t ? '#555' : 'transparent', color: 'white', border: 'none', borderRadius: '4px', cursor: currentSolving ? 'not-allowed' : 'pointer' }}>
+                                        Tier {t}
+                                    </button>
+                                ))}
+                            </div>
                         </div>
-                    </div>
+                    )}
 
                     <div style={{ display: 'flex', gap: '5px', backgroundColor: '#222', padding: '6px 8px', borderRadius: '6px', border: '1px solid #333', justifyContent: 'space-between', width: '100%', boxSizing: 'border-box' }}>
                         {(['Performance', 'Quality', 'Efficiency'] as const).map((stat, idx) => (
@@ -881,6 +901,8 @@ export default function ModuleInventoryUI() {
     const [invFilterGroup, setInvFilterGroup] = useState<FilterGroup | 'Placed' | 'NotPlaced'>('All');
     const [invFilterSize, setInvFilterSize] = useState<SizeFilter>('All');
     const [invFilterEffect, setInvFilterEffect] = useState<ItemEffect | 'All'>('All');
+    const [filterMachine, setFilterMachine] = useState('All');
+    const [invFilterMachine, setInvFilterMachine] = useState('All');
 
     const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null);
 
@@ -895,7 +917,7 @@ export default function ModuleInventoryUI() {
         const expanded: InventoryItem[] = [];
         for (const item of inventory) {
             expanded.push(item);
-            if (item.shape === 'Node1x2' && item.isInfinite) {
+            if (item.color === 'White' && item.isInfinite) {
                 const cloneCount = 17 * Math.max(1, machines.length);
                 for (let i = 0; i < cloneCount; i++) {
                     expanded.push({ ...item, id: `${item.id}_clone_${i}` });
@@ -943,7 +965,7 @@ export default function ModuleInventoryUI() {
                 } else {
                     const machine = machinesRef.current[currentTarget.machineId];
 
-                    if (machine) {
+                    if (machine?.checkModuleAllowed(currentDrag.item)) {
                         const targetX = currentTarget.x - currentDrag.dragOffsetX;
                         const targetY = currentTarget.y - currentDrag.dragOffsetY;
 
@@ -1058,7 +1080,7 @@ export default function ModuleInventoryUI() {
 
     const handleToggleInfiniteNodes = useCallback((isInfinite: boolean) => {
         setInventory(prev => prev.map(invItem =>
-            invItem.shape === 'Node1x2' ? { ...invItem, isInfinite } : invItem
+            invItem.color === 'White' ? { ...invItem, isInfinite } : invItem
         ));
     }, []);
 
@@ -1160,7 +1182,7 @@ export default function ModuleInventoryUI() {
     }, []);
 
     const handleInventoryDragStart = useCallback((e: React.MouseEvent, item: InventoryItem) => {
-        if (isAnySolving) { e.preventDefault(); return; }
+        if (isAnySolving || item.isStuck) { e.preventDefault(); return; }
         e.preventDefault();
         const offsets = PRECOMPUTED_OFFSETS.get(item.shape)?.[0] || [{x: 0, y: 0}];
 
@@ -1197,8 +1219,9 @@ export default function ModuleInventoryUI() {
     const filteredModules = MODULE_TEMPLATES.filter(m => {
         if (m.shapeType === 'Node') return false;
         if (filterGroup !== 'All' && m.group !== filterGroup) return false;
-        return !(filterSize !== 'All' && m.size !== filterSize);
-    });
+        if (filterSize !== 'All' && m.size !== filterSize) return false;
+        return matchesMachineFilter(m.allowedMachines, filterMachine);
+    }).sort(compareTemplatesByMachine);
 
     const filteredInventory = inventory.filter(item => {
         if (invFilterGroup === 'Placed') {
@@ -1208,10 +1231,9 @@ export default function ModuleInventoryUI() {
             const isPlaced = allUsedItems.has(item.id) || (item.isInfinite && Array.from(allUsedItems).some(usedId => usedId.startsWith(item.id + '_clone_')));
             if (isPlaced) return false;
         } else if (invFilterGroup !== 'All') {
-            const template = MODULE_TEMPLATES.find(m => m.shape === item.shape && m.color === item.color);
-            const group = template ? template.group : 'All';
-            if (group !== invFilterGroup) return false;
+            if ((getModuleTemplate(item)?.group ?? 'All') !== invFilterGroup) return false;
         }
+        if (!matchesMachineFilter(getModuleTemplate(item)?.allowedMachines, invFilterMachine)) return false;
         if (invFilterSize !== 'All') {
             const offsets = PRECOMPUTED_OFFSETS.get(item.shape)?.[0];
             const size = offsets ? offsets.length : 0;
@@ -1650,11 +1672,17 @@ export default function ModuleInventoryUI() {
                             <option value="Efficiency">Efficiency (Green)</option>
                             <option value="Special">Special Modules</option>
                         </select>
-                        <select value={filterSize} onChange={(e) => setFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as 3 | 4 | 5)} style={{ flex: 1, minWidth: '150px', padding: '8px 12px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none' }}>
+                        <select value={filterSize} onChange={(e) => setFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as SizeFilter)} style={{ flex: 1, minWidth: '150px', padding: '8px 12px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none' }}>
                             <option value="All">All Sizes</option>
+                            <option value={2}>Size 2</option>
                             <option value={3}>Size 3</option>
                             <option value={4}>Size 4</option>
                             <option value={5}>Size 5</option>
+                        </select>
+                        <select value={filterMachine} onChange={(e) => setFilterMachine(e.target.value)} style={{ flex: 1, minWidth: '150px', padding: '8px 12px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none' }}>
+                            <option value="All">All Machines</option>
+                            <option value="None">No Machine Restriction</option>
+                            {MACHINE_FILTER_OPTIONS.map(name => <option key={name} value={name}>{name}</option>)}
                         </select>
                     </div>
 
@@ -1681,7 +1709,7 @@ export default function ModuleInventoryUI() {
                                             {template.displayName}
                                         </span>
                                         <span style={{ fontSize: '0.65em', color: '#777', marginTop: '6px', textAlign: 'center' }}>
-                                            {template.shape === 'Node1x2' ? 'Node' : `${template.shapeType} - Size ${template.size}`}
+                                            {template.color === 'White' ? 'Node' : `${template.shapeType} - Size ${template.size}`}
                                         </span>
                                     </div>
                                 </div>
@@ -1728,8 +1756,9 @@ export default function ModuleInventoryUI() {
                             <option value="Efficiency">Efficiency</option>
                             <option value="Special">Special</option>
                         </select>
-                        <select value={invFilterSize} onChange={(e) => setInvFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as 3 | 4 | 5)} style={{ flex: 1, minWidth: '100px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
+                        <select value={invFilterSize} onChange={(e) => setInvFilterSize(e.target.value === 'All' ? 'All' : Number(e.target.value) as SizeFilter)} style={{ flex: 1, minWidth: '100px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
                             <option value="All">All Sizes</option>
+                            <option value={2}>Size 2</option>
                             <option value={3}>Size 3</option>
                             <option value={4}>Size 4</option>
                             <option value={5}>Size 5</option>
@@ -1737,6 +1766,11 @@ export default function ModuleInventoryUI() {
                         <select value={invFilterEffect} onChange={(e) => setInvFilterEffect(e.target.value as ItemEffect | 'All')} style={{ flex: 1, minWidth: '120px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
                             <option value="All">All Effects</option>
                             {EFFECTS_LIST.map(eff => <option key={eff} value={eff}>{eff === 'None' ? 'No Effect' : eff}</option>)}
+                        </select>
+                        <select value={invFilterMachine} onChange={(e) => setInvFilterMachine(e.target.value)} style={{ flex: 1, minWidth: '120px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
+                            <option value="All">All Machines</option>
+                            <option value="None">No Machine Restriction</option>
+                            {MACHINE_FILTER_OPTIONS.map(name => <option key={name} value={name}>{name}</option>)}
                         </select>
                     </div>
 

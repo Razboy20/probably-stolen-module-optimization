@@ -1,4 +1,5 @@
-import { PRECOMPUTED_OFFSETS, getBaseStats } from '../utils';
+import { PRECOMPUTED_OFFSETS, getBaseStats, isFixedStatModule } from '../utils';
+import { MODULE_TEMPLATES, STANDARD_GRID_SIZE, getGridSize } from '../constants';
 import type { InventoryItem, ModuleShape, ItemEffect, ModuleColor, Point, GridTier } from '../types';
 
 export interface ImportedMachine {
@@ -19,15 +20,20 @@ interface SaveValue {
     valueInt?: number;
 }
 
-interface SaveShape {
-    '<width>k__BackingField'?: number;
-    '<height>k__BackingField'?: number;
-    '<minX>k__BackingField'?: number;
-    '<minY>k__BackingField'?: number;
-    '<orientation>k__BackingField'?: number;
+type ShapeNumberField = 'width' | 'height' | 'minX' | 'minY' | 'orientation';
+
+// Older saves wrap every shape field in its C# backing-field name, newer ones store it plainly
+type SaveShape = { [K in ShapeNumberField as `<${K}>k__BackingField` | K]?: number } & {
     '<flipped>k__BackingField'?: boolean;
+    flipped?: boolean;
     data?: number[];
-}
+};
+
+const shapeNumber = (shape: SaveShape, key: ShapeNumberField): number | undefined =>
+    shape[`<${key}>k__BackingField`] ?? shape[key];
+
+const shapeFlipped = (shape: SaveShape): boolean =>
+    shape['<flipped>k__BackingField'] ?? shape.flipped ?? false;
 
 interface SaveItem {
     uuid: number;
@@ -120,6 +126,16 @@ const identityFromIdentifier = (identifier: string): ModuleIdentity | null => {
     return null;
 };
 
+// The machine-specific specials came with a game update no save here has an identifier for yet,
+// and some of them would trip the keyword checks above ("solvent_recovery" holds "eco"), so they are matched on their English name first
+const SPECIAL_TEMPLATES = MODULE_TEMPLATES.filter(t => t.group === 'Special' && !t.displayName.includes('Neural Core'));
+
+const specialIdentityFromName = (name: string): ModuleIdentity | null => {
+    const lower = name.toLowerCase();
+    const template = SPECIAL_TEMPLATES.find(t => lower.includes(t.displayName.toLowerCase()));
+    return template ? { color: template.color, isHighTier: false, displayName: template.displayName } : null;
+};
+
 const identityFromName = (name: string): ModuleIdentity => {
     const lower = name.toLowerCase();
     const isHighTier = lower.includes('overclock') || lower.includes('refinement') || lower.includes('eco') || lower.includes('uncapped');
@@ -144,7 +160,8 @@ const hasModuleName = (item: SaveItem): boolean => {
     return (allKeysString.includes("MODULE") ||
             allKeysString.includes("BONUS_PERCENTAGE_PERFORMANCE_INT") && typesStr.includes("MODULE")) &&
         (lower.includes('module') || lower.includes('node') || lower.includes('core') ||
-            lower.includes('alarm transmitter module') || lower.includes('(junk processing)') || lower.includes('(blast)'));
+            lower.includes('alarm transmitter module') || lower.includes('(junk processing)') || lower.includes('(blast)') ||
+            lower.includes('glitched'));
 };
 
 const isModule = (item: SaveItem): boolean => {
@@ -152,6 +169,8 @@ const isModule = (item: SaveItem): boolean => {
     const lower = (item.name || '').toLowerCase();
     if (identifier.includes('ruined') || identifier.includes('corrupted')) return false;
     if (lower.includes('ruined') || lower.includes('corrupted')) return false;
+    // Chemical equipment modules go in chemistry machines, which have no grid here
+    if (identifier.includes('chemical_equipment') || lower.includes('chemical equipment')) return false;
 
     const types = (item.itemTypes || []).map(t => t.toUpperCase());
     return types.includes('MODULE') || types.includes('NODE') || hasModuleName(item);
@@ -164,6 +183,10 @@ const MACHINE_NAMES: [string, string][] = [
     ['wine_rack', 'AgeWell'],
     ['mirage_projector', 'Mirage Projector'],
     ['desequencer', 'Cryptographic Desequencer'],
+    ['evaporator', 'Evaporator'],
+    ['hydroponic', 'Hydroponic System'],
+    ['printer', '3D Printer'],
+    ['dna', 'DNA Manipulator'],
     ['alarm', 'Alarm System'],
 ];
 
@@ -179,6 +202,10 @@ const machineNameFromName = (name: string): string | null => {
     if (lower.includes("agewell")) return "AgeWell";
     if (lower.includes("projector")) return "Mirage Projector";
     if (lower.includes("desequencer")) return "Cryptographic Desequencer";
+    if (lower.includes("evaporator")) return "Evaporator";
+    if (lower.includes("hydroponic")) return "Hydroponic System";
+    if (lower.includes("3d printer")) return "3D Printer";
+    if (lower.includes("dna")) return "DNA Manipulator";
     if (lower.includes("alarm")) return "Alarm System";
     return null;
 };
@@ -300,11 +327,11 @@ const numberSiblings = (children: SaveItem[]) => {
     children.sort((a, b) => {
         const aShape = a.itemModifiedShape || a.itemShape || {};
         const bShape = b.itemModifiedShape || b.itemShape || {};
-        const aY = aShape['<minY>k__BackingField'] ?? 0;
-        const bY = bShape['<minY>k__BackingField'] ?? 0;
+        const aY = shapeNumber(aShape, 'minY') ?? 0;
+        const bY = shapeNumber(bShape, 'minY') ?? 0;
         if (aY !== bY) return aY - bY;
-        const aX = aShape['<minX>k__BackingField'] ?? 0;
-        const bX = bShape['<minX>k__BackingField'] ?? 0;
+        const aX = shapeNumber(aShape, 'minX') ?? 0;
+        const bX = shapeNumber(bShape, 'minX') ?? 0;
         return aX - bX;
     });
 
@@ -354,19 +381,33 @@ const readMachineTier = (machine: SaveItem): GridTier => {
     return (stageVal + 1) as GridTier;
 };
 
-const placeOnBoard = (boardIds: (string | null)[][], invId: string, shape: SaveShape) => {
-    const w = shape['<width>k__BackingField'] ?? 1;
-    const h = shape['<height>k__BackingField'] ?? 1;
-    const minX = shape['<minX>k__BackingField'] ?? 0;
-    const minY = shape['<minY>k__BackingField'] ?? 0;
-    const orientation = shape['<orientation>k__BackingField'] || 0;
-    const flipped = shape['<flipped>k__BackingField'] || false;
+const placeOnBoard = (boardIds: (string | null)[][], invId: string, shape: SaveShape, grid: { rows: number, cols: number }) => {
+    const w = shapeNumber(shape, 'width') ?? 1;
+    const h = shapeNumber(shape, 'height') ?? 1;
+    const minX = shapeNumber(shape, 'minX') ?? 0;
+    const minY = shapeNumber(shape, 'minY') ?? 0;
+    const orientation = shapeNumber(shape, 'orientation') ?? 0;
 
-    for (const p of getTransformedPoints(w, h, shape.data || [], orientation, flipped)) {
+    for (const p of getTransformedPoints(w, h, shape.data || [], orientation, shapeFlipped(shape))) {
         const finalX = minX + p.x;
         const finalY = minY + p.y;
-        if (finalY >= 0 && finalY < 5 && finalX >= 0 && finalX < 7) boardIds[finalY][finalX] = invId;
+        if (finalY >= 0 && finalY < grid.rows && finalX >= 0 && finalX < grid.cols) boardIds[finalY][finalX] = invId;
     }
+};
+
+const isStuckModule = (item: SaveItem, displayName: string): boolean => {
+    if (displayName === 'Glitched Module') return true;
+    const tags = [...(item._keys || []), ...(item._values || []).map(v => v.internalValueString || '')];
+    return tags.some(tag => tag.toUpperCase().includes('STUCK'));
+};
+
+// The machine's path ends in its own name, which may be a custom one or a localized one;
+// the machine type it really is goes after it in parentheses, where getMachineTypeName looks for it
+const machineTypeLabel = (path: string, machineName: string | undefined): string => {
+    if (!path) return machineName || "Select Machine...";
+    if (!machineName) return path;
+    const lastSegment = path.split('>').pop()!.toLowerCase();
+    return lastSegment.includes(machineName.toLowerCase()) ? path : `${path} (${machineName})`;
 };
 
 export const parseSaveFile = (raw: string): ImportedSave => {
@@ -404,10 +445,12 @@ export const parseSaveFile = (raw: string): ImportedSave => {
         if (!isModule(item)) return;
 
         const shapeData = item.itemShape?.data;
-        const w = item.itemShape?.['<width>k__BackingField'];
+        const w = item.itemShape ? shapeNumber(item.itemShape, 'width') : undefined;
         if (!shapeData || w === undefined) return;
 
-        const { color, isHighTier, displayName } = identityFromIdentifier(item.identifier || '') ?? identityFromName(item.name || '');
+        const { color, isHighTier, displayName } = specialIdentityFromName(item.name || '')
+            ?? identityFromIdentifier(item.identifier || '')
+            ?? identityFromName(item.name || '');
 
         const blocks = shapeData.filter(b => b === 1).length;
         let shape = getShapeFromData(w, shapeData, isHighTier, blocks);
@@ -417,8 +460,10 @@ export const parseSaveFile = (raw: string): ImportedSave => {
             else if (blocks === 4) shape = isHighTier ? 'L4_High' : 'L4_Base';
             else shape = 'P5';
         }
+        // A two-cell piece is only a Node when it is white; the coloured ones are two-cell specials
+        if (shape === 'Node1x2' && color !== 'White') shape = 'Line1x2';
 
-        const [eff1, eff2] = readEffects(item);
+        const [eff1, eff2]: [ItemEffect, ItemEffect] = isFixedStatModule({ displayName }) ? ['None', 'None'] : readEffects(item);
 
         let primaryStat: number | null = null;
         if (color === 'Red' || color === 'Purple') primaryStat = getIntVal(item, "BONUS_PERCENTAGE_PERFORMANCE_INT");
@@ -449,7 +494,7 @@ export const parseSaveFile = (raw: string): ImportedSave => {
             effects: [eff1, eff2],
             effectValues: [effValue(eff1), effValue(eff2)],
             isInfinite: false,
-            isLocked: false,
+            isStuck: isStuckModule(item, displayName),
             originalPath
         } as InventoryItem);
 
@@ -459,16 +504,17 @@ export const parseSaveFile = (raw: string): ImportedSave => {
     });
 
     machineContents.forEach((contents, machineId) => {
-        const boardIds = Array.from({ length: 5 }, () => Array.from({ length: 7 }, () => null as string | null));
-        contents.forEach(({ invId, modifiedShape }) => placeOnBoard(boardIds, invId, modifiedShape));
+        const machineName = machineNames.get(machineId);
+        const grid = getGridSize(machineName === 'Evaporator');
+        const boardIds = Array.from({ length: STANDARD_GRID_SIZE.rows }, () => Array.from({ length: STANDARD_GRID_SIZE.cols }, () => null as string | null));
+        contents.forEach(({ invId, modifiedShape }) => placeOnBoard(boardIds, invId, modifiedShape, grid));
 
         const machine = itemMap.get(machineId);
-        const path = buildPath(machineId, itemMap, parentMap);
 
         machines.push({
             id: `m_${Math.random().toString(36).substring(2, 8)}`,
             boardIds,
-            machineType: path || machineNames.get(machineId) || "Select Machine...",
+            machineType: machineTypeLabel(buildPath(machineId, itemMap, parentMap), machineName),
             tier: machine ? readMachineTier(machine) : 1
         });
     });

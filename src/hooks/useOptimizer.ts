@@ -5,6 +5,7 @@ import { calculateBoardStats, indexInventoryById } from '../solver/boardStats';
 import { decodeSolution, generateCodeFromState, inventoryForCode } from '../solver/codec';
 import type { BoardUpdate } from '../solver/report';
 import { isLockedModule } from '../solver/locked';
+import { getMachineTypeName, isEvaporatorMachine, isModuleAllowedInMachine } from '../utils';
 
 export type StatFlags = Record<keyof Stats, boolean>;
 export type StatRanks = Record<keyof Stats, number>;
@@ -18,6 +19,9 @@ export function useOptimizer(
     defaultTier: GridTier = 3,
     isAnySolving: boolean = false
 ) {
+    const [machineType, setMachineType] = useState(() => localStorage.getItem(`optimizer_machine_type_${machineId}`) || '');
+    const isEvaporator = isEvaporatorMachine(machineType);
+
     const getSavedState = () => {
         const saved = localStorage.getItem(`optimizer_machine_${machineId}`);
         if (saved) {
@@ -48,7 +52,7 @@ export function useOptimizer(
     const [ignoreStats, setIgnoreStats] = useState<StatFlags>(savedState?.ignoreStats ?? { Performance: false, Quality: false, Efficiency: false });
     const [statPriority, setStatPriority] = useState<StatRanks>(savedState?.statPriority ?? { Performance: 1, Quality: 1, Efficiency: 1 });
 
-    const [board, setBoard] = useState<Board>(() => initializeBoard(savedState?.tier ?? defaultTier, savedState?.boardIds, inventory));
+    const [board, setBoard] = useState<Board>(() => initializeBoard(savedState?.tier ?? defaultTier, savedState?.boardIds, inventory, isEvaporator));
     const boardRef = useRef(board);
     const setBoardSync = (newBoard: Board) => {
         boardRef.current = newBoard;
@@ -61,17 +65,54 @@ export function useOptimizer(
     const [warningMsg, setWarningMsg] = useState<string | null>(null);
     const [solutionCode, setSolutionCode] = useState<string>('');
 
-    const handleTierChange = (newTier: GridTier) => {
-        setTier(newTier);
-        setBoardSync(initializeBoard(newTier));
+    const startOver = (newTier: GridTier, evaporator: boolean) => {
+        setBoardSync(initializeBoard(newTier, undefined, undefined, evaporator));
         setBestTotals({ Performance: 0, Quality: 0, Efficiency: 0 });
         setBestPieceStats(new Map());
         setWarningMsg(null);
         setSolutionCode('');
     };
 
+    const handleTierChange = (newTier: GridTier) => {
+        setTier(newTier);
+        startOver(newTier, isEvaporator);
+    };
+
+    // Switching between an Evaporator and a standard machine changes the grid, so the board starts over; otherwise only the modules the new machine refuses come off
+    const updateMachineType = (newType: string) => {
+        if (newType === machineType) return;
+        setMachineType(newType);
+        localStorage.setItem(`optimizer_machine_type_${machineId}`, newType);
+        const nextIsEvaporator = isEvaporatorMachine(newType);
+        if (nextIsEvaporator !== isEvaporator) {
+            startOver(tier, nextIsEvaporator);
+            return;
+        }
+        const removedNames = new Set<string>();
+        const next = boardRef.current.map(row => row.map(cell => {
+            if (cell && cell !== 'Locked' && !cell.isStuck && !isModuleAllowedInMachine(cell, newType)) {
+                removedNames.add(cell.displayName);
+                return null;
+            }
+            return cell;
+        }));
+        if (removedNames.size > 0) {
+            setBoardSync(next);
+            setWarningMsg(`Removed ${[...removedNames].join(', ')}: incompatible with ${getMachineTypeName(newType)}.`);
+        }
+    };
+
+    const machineLabel = machineType ? getMachineTypeName(machineType) : 'this machine';
+    const isModuleAllowed = (item: InventoryItem) => isModuleAllowedInMachine(item, machineType);
+
+    const checkModuleAllowed = (item: InventoryItem) => {
+        if (isModuleAllowed(item)) return true;
+        setWarningMsg(`Cannot place ${item.displayName}: incompatible with ${machineLabel}.`);
+        return false;
+    };
+
     const emptyBoard = (keepLockedModules: boolean) => {
-        const fresh = initializeBoard(tier);
+        const fresh = initializeBoard(tier, undefined, undefined, isEvaporator);
         if (keepLockedModules) {
             for (let y = 0; y < 5; y++) {
                 for (let x = 0; x < 7; x++) {
@@ -155,6 +196,7 @@ export function useOptimizer(
     };
 
     const isValidPlacement = (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => {
+        if (!isModuleAllowed(item)) return false;
         for (const pt of offsets) {
             const px = rootX + pt.x;
             const py = rootY + pt.y;
@@ -169,6 +211,17 @@ export function useOptimizer(
     const importSolution = (code: string) => {
         try {
             const decoded = decodeSolution(code);
+            if (decoded.isEvaporator !== isEvaporator) {
+                setWarningMsg(decoded.isEvaporator
+                    ? 'This solution code was made for an Evaporator (4x4 grid). Select an Evaporator machine to import it.'
+                    : 'This solution code was made for a standard (7x5 grid) machine and cannot be imported into an Evaporator.');
+                return;
+            }
+            const incompatible = new Set(decoded.board.flat().filter(cell => cell && cell !== 'Locked' && !isModuleAllowed(cell)).map(cell => (cell as InventoryItem).displayName));
+            if (incompatible.size > 0) {
+                setWarningMsg(`This solution contains modules that cannot be placed in ${machineLabel}: ${[...incompatible].join(', ')}.`);
+                return;
+            }
             setTier(decoded.tier);
             setMaximizeStats(decoded.maximizeStats);
             setTargetStats(decoded.targetStats);
@@ -228,7 +281,7 @@ export function useOptimizer(
         tier, setTier, handleTierChange, targetStats, setTargetStats,
         maximizeStats, setMaximizeStats, ignoreStats, setIgnoreStats,
         statPriority, setStatPriority, board, bestTotals, bestPieceStats,
-        warningMsg, setWarningMsg, applyUpdate,
+        warningMsg, setWarningMsg, applyUpdate, machineType, updateMachineType, isEvaporator, checkModuleAllowed,
         solutionCode, setSolutionCode, importSolution, resetBoard, resetBoardIncludingLocked,
         manuallyPlaceItem, manuallyRemoveItem, isValidPlacement, boardRef
     };
