@@ -1,7 +1,9 @@
 import type { ModuleShape } from '../types';
 import { SHAPE_DEFINITIONS } from '../constants';
 import { PRECOMPUTED_ORIENTATIONS } from '../utils';
-import { NEIGHBOR_DX, NEIGHBOR_DY } from './board';
+
+export const NEIGHBOR_DX = [0, 0, -1, 1];
+export const NEIGHBOR_DY = [-1, 1, 0, 0];
 
 export const BOARD_W = 7;
 export const BOARD_H = 5;

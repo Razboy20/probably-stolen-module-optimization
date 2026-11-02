@@ -1,5 +1,4 @@
-import { NEIGHBOR_DX, NEIGHBOR_DY } from './board';
-import { BOARD_CELLS, BOARD_H, BOARD_W, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS } from './geometry';
+import { BOARD_CELLS, BOARD_H, BOARD_W, MAX_PIECE_CELLS, MAX_PIECE_NEIGHBORS, NEIGHBOR_DX, NEIGHBOR_DY } from './geometry';
 import type { IndexBoard } from './indexBoard';
 import { FLAG_RECEIVER, FLAG_SIDE_MOUNT, FLAG_TOP_MOUNT, FLAG_WHITE, nfCountOf, type PoolTables, recvBonus } from './tables';
 import { MAX_PIECES_PER_BOARD } from './pool';

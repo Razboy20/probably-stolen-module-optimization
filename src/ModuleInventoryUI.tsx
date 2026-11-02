@@ -1,15 +1,18 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, forwardRef, useImperativeHandle, useCallback, useMemo } from 'react';
-import type { Stats, GridTier, InventoryItem, FilterGroup, ItemEffect, ModuleTemplate, ModuleColor, Point } from './types';
-import { COLOR_MAP, EFFECT_COLORS, EFFECTS_LIST, MACHINE_GROUP_ORDER, MODULE_TEMPLATES, NODE_TEMPLATE, getGridSize } from './constants';
-import { applyInternalEffects, compareTemplatesByMachine, formatStatValue, getStatColor, getBaseStats, getModuleTemplate, isFixedStatModule, PRECOMPUTED_OFFSETS } from './utils';
+import type { Stats, GridTier, InventoryItem, FilterGroup, ItemEffect, MachineKind, ModuleTemplate, ModuleColor, Point } from './types';
+import { COLOR_MAP, EFFECT_COLORS, EFFECTS_LIST, MACHINE_KINDS, NODE_TEMPLATE } from './constants';
+import { formatStatValue, getStatColor, getBaseStats, PRECOMPUTED_OFFSETS } from './utils';
 import { useOptimizer } from './hooks/useOptimizer';
 import { useJointSolve, type MachineHandle } from './hooks/useJointSolve';
 import { isLockedModule } from './solver/locked';
 import { hasObjective, STAT_KEYS } from './solver/objective';
-import type { BoardCell } from './solver/board';
+import { type BoardCell, gridSizeOf } from './solver/board';
+import type { ImportedMachine } from './save/parseSave';
 import MiniShape from './components/MiniShape';
 import SaveFileImporter from './components/SaveFileImporter';
 import BackendSelect from './components/BackendSelect';
+import { InventoryItemRow } from './components/InventoryItemRow';
+import { filterCatalog, filterInventory, type InventoryGroupFilter, MACHINE_FILTER_OPTIONS, type MachineFilter, type SizeFilter } from './filters';
 
 type DragTarget = { machineId: string | null; x: number; y: number };
 
@@ -26,26 +29,11 @@ type DragState = {
 
 type HoverInfo = { x: number; y: number; cell: InventoryItem; stats?: Stats };
 
-type SizeFilter = 'All' | 2 | 3 | 4 | 5;
-
-const MACHINE_TYPE_OPTIONS = ['Moisture Farm', 'Furnace', 'Water Purifier', 'Alarm System', 'AgeWell', 'Cryptographic Desequencer', 'Mirage Projector', 'Evaporator', 'Hydroponic System', '3D Printer', 'DNA Manipulator'];
-const MACHINE_FILTER_OPTIONS = MACHINE_GROUP_ORDER.filter(name => MODULE_TEMPLATES.some(t => t.allowedMachines?.includes(name)));
-
-const STAT_ABBREVIATIONS: Record<keyof Stats, string> = { Performance: 'Perf', Quality: 'Qual', Efficiency: 'Eff' };
-
-const matchesMachineFilter = (allowedMachines: string[] | undefined, filter: string) => {
-    if (filter === 'All') return true;
-    if (filter === 'None') return !allowedMachines?.length;
-    return !!allowedMachines?.includes(filter);
-};
-
 interface MachineRef extends MachineHandle {
     clear: () => void;
     clearIncludingLocked: () => void;
-    place: (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => void;
+    tryPlace: (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => boolean;
     remove: (itemId: string) => void;
-    isValidPlacement: (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => boolean;
-    checkModuleAllowed: (item: InventoryItem) => boolean;
 }
 
 const newMachineId = () => `m_${Math.random().toString(36).substring(2, 8)}`;
@@ -55,6 +43,23 @@ const readStoredJson = <T,>(key: string): T | null => {
     if (!saved) return null;
     try { return JSON.parse(saved); } catch { return null; }
 };
+
+const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// A machine picked from the list is numbered after the highest of its kind, counting the numbered labels a save brought in too
+const nextMachineLabel = (kind: MachineKind, machineId: string) => {
+    const pattern = new RegExp(`(?:^|\\s|>\\s*)${escapeRegex(kind)}\\s+(\\d+)$`);
+    let max = 0;
+    for (const key of Object.keys(localStorage)) {
+        if (!key.startsWith('optimizer_machine_') || key === `optimizer_machine_${machineId}`) continue;
+        const label = readStoredJson<{ label?: unknown }>(key)?.label;
+        const match = typeof label === 'string' ? label.match(pattern) : null;
+        if (match) max = Math.max(max, Number(match[1]));
+    }
+    return `${kind} ${max + 1}`;
+};
+
+const shortenLabel = (label: string) => label.length > 45 ? '...' + label.substring(label.length - 42) : label;
 
 // offload mouse tracking to useRef; performance
 const DragGhost = ({ dragState, cellSize }: { dragState: DragState | null, cellSize: number }) => {
@@ -106,141 +111,6 @@ const DragGhost = ({ dragState, cellSize }: { dragState: DragState | null, cellS
         </div>
     );
 };
-
-type InventoryItemRowProps = {
-    item: InventoryItem;
-    isAnySolving: boolean;
-    updateItemEffect: (item: InventoryItem, effectIndex: 0 | 1, newEffect: ItemEffect) => void;
-    updateItemEffectValue: (itemId: string, effectIndex: 0 | 1, newValue: number) => void;
-    handleBlurEffectValue: (item: InventoryItem, effectIndex: 0 | 1, rawValue: number) => void;
-    onRemove: (itemId: string) => void;
-    onDragStart: (e: React.MouseEvent, item: InventoryItem) => void;
-    onToggleInfinite: (isInfinite: boolean) => void;
-    onToggleLock: (itemId: string, isLocked: boolean) => void;
-};
-
-const InventoryItemRow = React.memo(({ item, isAnySolving, updateItemEffect, updateItemEffectValue, handleBlurEffectValue, onRemove, onDragStart, onToggleInfinite, onToggleLock }: InventoryItemRowProps) => {
-    const locked = isLockedModule(item);
-    const fixedBase = isFixedStatModule(item) ? getBaseStats(item) : null;
-    const shownStats = item.color !== 'White' ? (fixedBase ?? applyInternalEffects(item)) : null;
-    return (
-        <div
-            onMouseDown={(e) => onDragStart(e, item)}
-            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', backgroundColor: '#252526', borderRadius: '4px', borderLeft: `4px solid ${COLOR_MAP[item.color as ModuleColor]}`, cursor: isAnySolving || item.isStuck ? 'default' : 'grab' }}
-        >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', width: '100%' }}>
-                <MiniShape shape={item.shape} colorHex={COLOR_MAP[item.color as ModuleColor]} size="10px" />
-
-                <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: '4px', pointerEvents: 'none' }}>
-                    <span style={{ fontSize: '0.9em', fontWeight: 'bold', color: '#eee' }}>{item.displayName}</span>
-
-                    {shownStats && (
-                        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', fontSize: '0.75em', fontWeight: 'bold' }}>
-                            {STAT_KEYS.map(stat => shownStats[stat] !== 0 && (
-                                <span key={stat} style={{ color: getStatColor(shownStats[stat]) }}>
-                                    {STAT_ABBREVIATIONS[stat]} {formatStatValue(shownStats[stat])}
-                                </span>
-                            ))}
-                            {STAT_KEYS.every(stat => shownStats[stat] === 0) && <span style={{ color: '#888' }}>No stat changes</span>}
-                        </div>
-                    )}
-
-                    {fixedBase ? null : item.color !== 'White' ? (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '100%', pointerEvents: 'auto' }}>
-                            {[0, 1].map((effectIdx) => {
-                                const currentEffect = item.effects[effectIdx];
-                                const showCustomInput = currentEffect === 'Learning Algorithm' || currentEffect === 'Degrading';
-
-                                return (
-                                    <div key={effectIdx} style={{ display: 'flex', gap: '6px', alignItems: 'center', width: '100%' }} onMouseDown={(e) => e.stopPropagation()}>
-                                        <select
-                                            value={currentEffect}
-                                            onChange={(e) => updateItemEffect(item, effectIdx as 0 | 1, e.target.value as ItemEffect)}
-                                            disabled={isAnySolving}
-                                            style={{ flex: 1, padding: '2px', fontSize: '0.7em', backgroundColor: '#111', color: '#eee', border: '1px solid #444', borderRadius: '3px', minWidth: '0', cursor: isAnySolving ? 'not-allowed' : 'pointer', opacity: isAnySolving ? 0.6 : 1 }}
-                                        >
-                                            {EFFECTS_LIST.filter(eff => eff === 'None' || eff !== item.effects[effectIdx === 0 ? 1 : 0]).map(eff => (
-                                                <option key={eff} value={eff}>{eff === 'None' ? 'No Effect' : eff}</option>
-                                            ))}
-                                        </select>
-
-                                        {showCustomInput && (
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }} title="Custom Percentage Value">
-                                                <input
-                                                    type="number"
-                                                    value={item.effectValues[effectIdx]}
-                                                    onChange={(e) => updateItemEffectValue(item.id, effectIdx as 0 | 1, Number(e.target.value))}
-                                                    onBlur={(e) => handleBlurEffectValue(item, effectIdx as 0 | 1, Number(e.target.value))}
-                                                    disabled={isAnySolving}
-                                                    style={{ width: '48px', padding: '1px', fontSize: '0.7em', backgroundColor: '#111', color: '#eee', border: '1px solid #444', borderRadius: '3px', textAlign: 'center', cursor: isAnySolving ? 'not-allowed' : 'auto', opacity: isAnySolving ? 0.6 : 1 }}
-                                                />
-                                                <span style={{ fontSize: '0.65em', color: '#aaa' }}>%</span>
-                                            </div>
-                                        )}
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    ) : (
-                        <div style={{ display: 'flex', alignItems: 'center', width: '100%', pointerEvents: 'auto' }} onMouseDown={(e) => e.stopPropagation()}>
-                            <label style={{ fontSize: '0.75em', color: '#ccc', display: 'flex', alignItems: 'center', gap: '6px', cursor: isAnySolving ? 'not-allowed' : 'pointer' }}>
-                                <input
-                                    type="checkbox"
-                                    checked={!!item.isInfinite}
-                                    onChange={(e) => onToggleInfinite(e.target.checked)}
-                                    disabled={isAnySolving}
-                                    style={{ margin: 0, cursor: isAnySolving ? 'not-allowed' : 'pointer' }}
-                                />
-                                Infinite Nodes
-                            </label>
-                        </div>
-                    )}
-                </div>
-            </div>
-
-            <div style={{ display: 'flex', marginLeft: '8px', alignItems: 'center', gap: '4px' }}>
-                <button
-                    onMouseDown={(e) => e.stopPropagation()}
-                    onClick={() => onToggleLock(item.id, !locked)}
-                    disabled={isAnySolving || item.isStuck}
-                    title={item.isStuck ? 'A stuck module cannot be moved or unlocked' : 'The optimizer never adds, removes or moves a locked module to another machine, only rearranges it on its board; you can place it anywhere'}
-                    style={{
-                        background: locked ? 'rgba(255, 77, 77, 0.1)' : 'transparent',
-                        border: `1px solid ${locked ? '#ff4d4d' : '#555'}`,
-                        color: locked ? '#ff4d4d' : '#aaa',
-                        borderRadius: '4px',
-                        padding: '4px 8px',
-                        cursor: isAnySolving ? 'not-allowed' : 'pointer',
-                        fontSize: '0.75em',
-                        fontWeight: 'bold',
-                        minWidth: '60px'
-                    }}
-                >
-                    {item.isStuck ? 'Stuck' : locked ? 'Unlock' : 'Lock'}
-                </button>
-                <button
-                    onMouseDown={(e) => e.stopPropagation()}
-                    onClick={() => onRemove(item.id)}
-                    disabled={isAnySolving}
-                    style={{
-                        background: 'none',
-                        border: 'none',
-                        color: isAnySolving ? '#444' : '#666',
-                        cursor: isAnySolving ? 'not-allowed' : 'pointer',
-                        fontSize: '1.4em',
-                        padding: '8px',
-                        marginRight: '-5px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center'
-                    }}
-                >
-                    &times;
-                </button>
-            </div>
-        </div>
-    );
-});
 
 type MachineInstanceProps = {
     machineId: string;
@@ -294,16 +164,15 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
     const currentSolving: boolean = isSolving;
     const machineState = useMemo(() => ({
         tier: optimizer.tier,
-        machineType: optimizer.machineType,
+        kind: optimizer.kind,
         maximizeStats: optimizer.maximizeStats,
         targetStats: optimizer.targetStats,
         ignoreStats: optimizer.ignoreStats,
         statPriority: optimizer.statPriority
-    }), [optimizer.tier, optimizer.machineType, optimizer.maximizeStats, optimizer.targetStats, optimizer.ignoreStats, optimizer.statPriority]);
+    }), [optimizer.tier, optimizer.kind, optimizer.maximizeStats, optimizer.targetStats, optimizer.ignoreStats, optimizer.statPriority]);
     const canRun = currentSolving || (inventory.length > 0 && hasObjective(machineState));
 
-    const machineType = optimizer.machineType || 'Select Machine...';
-    const gridSize = getGridSize(optimizer.isEvaporator);
+    const gridSize = gridSizeOf(optimizer.layout);
 
     useEffect(() => {
         localStorage.setItem(`optimizer_machine_locked_${machineId}`, String(isMachineLocked));
@@ -325,11 +194,9 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
         setWarning: optimizer.setWarningMsg,
         clear: optimizer.resetBoard,
         clearIncludingLocked: optimizer.resetBoardIncludingLocked,
-        place: optimizer.manuallyPlaceItem,
+        tryPlace: optimizer.tryPlace,
         remove: optimizer.manuallyRemoveItem,
         getState: () => machineState,
-        isValidPlacement: optimizer.isValidPlacement,
-        checkModuleAllowed: optimizer.checkModuleAllowed,
         getBoard: () => optimizer.boardRef.current,
         isLocked: () => isMachineLocked
     }), [optimizer, machineState, isMachineLocked]);
@@ -630,28 +497,11 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%', boxSizing: 'border-box' }}>
                     <select
-                        title={machineType !== "Select Machine..." ? machineType : undefined}
-                        value={machineType}
+                        title={optimizer.label || undefined}
+                        value={optimizer.kind ?? ''}
                         onChange={(e) => {
-                            const selected = e.target.value;
-                            const allKeys = Object.keys(localStorage).filter(k => k.startsWith('optimizer_machine_type_'));
-                            let max = 0;
-
-                            const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                            const regex = new RegExp(`(?:^|\\s|>\\s*)${escapeRegex(selected)}\\s+(\\d+)$`);
-
-                            allKeys.forEach(k => {
-                                if (k === `optimizer_machine_type_${machineId}`) return;
-                                const val = localStorage.getItem(k);
-                                if (val) {
-                                    const match = val.match(regex);
-                                    if (match) {
-                                        const num = parseInt(match[1], 10);
-                                        if (num > max) max = num;
-                                    }
-                                }
-                            });
-                            optimizer.updateMachineType(`${selected} ${max + 1}`);
+                            const kind = e.target.value as MachineKind;
+                            optimizer.changeMachineKind(kind, nextMachineLabel(kind, machineId));
                         }}
                         disabled={currentSolving}
                         style={{
@@ -661,16 +511,13 @@ const MachineInstance = React.memo(forwardRef<MachineRef, MachineInstanceProps>(
                             textOverflow: 'ellipsis', whiteSpace: 'nowrap', overflow: 'hidden'
                         }}
                     >
-                        <option value="Select Machine..." disabled>Select Machine...</option>
-                        {machineType !== "Select Machine..." && !MACHINE_TYPE_OPTIONS.includes(machineType) && (
-                            <option value={machineType}>
-                                {machineType.length > 45 ? '...' + machineType.substring(machineType.length - 42) : machineType}
-                            </option>
-                        )}
-                        {MACHINE_TYPE_OPTIONS.map(name => <option key={name} value={name}>{name}</option>)}
+                        <option value="" disabled>Select Machine...</option>
+                        {MACHINE_KINDS.map(kind => (
+                            <option key={kind} value={kind}>{kind === optimizer.kind && optimizer.label ? shortenLabel(optimizer.label) : kind}</option>
+                        ))}
                     </select>
 
-                    {!optimizer.isEvaporator && (
+                    {optimizer.layout !== 'Evaporator' && (
                         <div style={{ display: 'flex', justifyContent: 'center' }}>
                             <div style={{ display: 'flex', gap: '5px', backgroundColor: '#222', padding: '5px', borderRadius: '6px' }}>
                                 {[1, 2, 3].map((t) => (
@@ -899,11 +746,11 @@ export default function ModuleInventoryUI() {
     const [filterGroup, setFilterGroup] = useState<FilterGroup>('All');
     const [filterSize, setFilterSize] = useState<SizeFilter>('All');
 
-    const [invFilterGroup, setInvFilterGroup] = useState<FilterGroup | 'Placed' | 'NotPlaced'>('All');
+    const [invFilterGroup, setInvFilterGroup] = useState<InventoryGroupFilter>('All');
     const [invFilterSize, setInvFilterSize] = useState<SizeFilter>('All');
     const [invFilterEffect, setInvFilterEffect] = useState<ItemEffect | 'All'>('All');
-    const [filterMachine, setFilterMachine] = useState('All');
-    const [invFilterMachine, setInvFilterMachine] = useState('All');
+    const [filterMachine, setFilterMachine] = useState<MachineFilter>('All');
+    const [invFilterMachine, setInvFilterMachine] = useState<MachineFilter>('All');
 
     const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null);
 
@@ -966,18 +813,15 @@ export default function ModuleInventoryUI() {
                 } else {
                     const machine = machinesRef.current[currentTarget.machineId];
 
-                    if (machine?.checkModuleAllowed(currentDrag.item)) {
-                        const targetX = currentTarget.x - currentDrag.dragOffsetX;
-                        const targetY = currentTarget.y - currentDrag.dragOffsetY;
+                    const targetX = currentTarget.x - currentDrag.dragOffsetX;
+                    const targetY = currentTarget.y - currentDrag.dragOffsetY;
 
-                        if (machine.isValidPlacement(currentDrag.item, targetX, targetY, currentDrag.offsets)) {
-                            Object.keys(machinesRef.current).forEach(mId => {
-                                if (mId !== currentTarget.machineId) {
-                                    machinesRef.current[mId]?.remove(currentDrag.item.id);
-                                }
-                            });
-                            machine.place(currentDrag.item, targetX, targetY, currentDrag.offsets);
-                        }
+                    if (machine?.tryPlace(currentDrag.item, targetX, targetY, currentDrag.offsets)) {
+                        Object.keys(machinesRef.current).forEach(mId => {
+                            if (mId !== currentTarget.machineId) {
+                                machinesRef.current[mId]?.remove(currentDrag.item.id);
+                            }
+                        });
                     }
                 }
             }
@@ -1217,38 +1061,8 @@ export default function ModuleInventoryUI() {
         window.dispatchEvent(evt);
     }, [isAnySolving]);
 
-    const filteredModules = MODULE_TEMPLATES.filter(m => {
-        if (m.shapeType === 'Node') return false;
-        if (filterGroup !== 'All' && m.group !== filterGroup) return false;
-        if (filterSize !== 'All' && m.size !== filterSize) return false;
-        return matchesMachineFilter(m.allowedMachines, filterMachine);
-    }).sort(compareTemplatesByMachine);
-
-    const filteredInventory = inventory.filter(item => {
-        if (invFilterGroup === 'Placed') {
-            const isPlaced = allUsedItems.has(item.id) || (item.isInfinite && Array.from(allUsedItems).some(usedId => usedId.startsWith(item.id + '_clone_')));
-            if (!isPlaced) return false;
-        } else if (invFilterGroup === 'NotPlaced') {
-            const isPlaced = allUsedItems.has(item.id) || (item.isInfinite && Array.from(allUsedItems).some(usedId => usedId.startsWith(item.id + '_clone_')));
-            if (isPlaced) return false;
-        } else if (invFilterGroup !== 'All') {
-            if ((getModuleTemplate(item)?.group ?? 'All') !== invFilterGroup) return false;
-        }
-        if (!matchesMachineFilter(getModuleTemplate(item)?.allowedMachines, invFilterMachine)) return false;
-        if (invFilterSize !== 'All') {
-            const offsets = PRECOMPUTED_OFFSETS.get(item.shape)?.[0];
-            const size = offsets ? offsets.length : 0;
-            if (size !== invFilterSize) return false;
-        }
-        if (invFilterEffect !== 'All') {
-            if (invFilterEffect === 'None') {
-                if (item.effects[0] !== 'None' || item.effects[1] !== 'None') return false;
-            } else {
-                if (item.effects[0] !== invFilterEffect && item.effects[1] !== invFilterEffect) return false;
-            }
-        }
-        return true;
-    });
+    const filteredModules = filterCatalog({ group: filterGroup, size: filterSize, machine: filterMachine });
+    const filteredInventory = filterInventory(inventory, { group: invFilterGroup, size: invFilterSize, effect: invFilterEffect, machine: invFilterMachine }, allUsedItems);
 
     const visibleInventory = filteredInventory.length > MAX_VISIBLE_INVENTORY_ROWS
         ? filteredInventory.slice(0, MAX_VISIBLE_INVENTORY_ROWS)
@@ -1266,18 +1080,16 @@ export default function ModuleInventoryUI() {
         ));
     };
 
-    const handleImportSave = useCallback((newItems: InventoryItem[], newMachines: { id: string, boardIds: (string | null)[][], machineType: string, tier: GridTier }[]) => {
+    const handleImportSave = useCallback((newItems: InventoryItem[], newMachines: ImportedMachine[]) => {
         setInventory(newItems);
 
-        newMachines.forEach(m => {
-            localStorage.setItem(`optimizer_machine_${m.id}`, JSON.stringify({ boardIds: m.boardIds, tier: m.tier }));
-            localStorage.setItem(`optimizer_machine_type_${m.id}`, m.machineType);
+        newMachines.forEach(({ id, boardIds, tier, kind, label }) => {
+            localStorage.setItem(`optimizer_machine_${id}`, JSON.stringify({ boardIds, tier, kind, label }));
         });
 
         setMachines(prev => {
             prev.forEach(m => {
                 localStorage.removeItem(`optimizer_machine_${m.id}`);
-                localStorage.removeItem(`optimizer_machine_type_${m.id}`);
                 localStorage.removeItem(`optimizer_machine_locked_${m.id}`);
             });
             return newMachines.length > 0
@@ -1328,7 +1140,6 @@ export default function ModuleInventoryUI() {
                 preservedMachines.push(m);
             } else {
                 localStorage.removeItem(`optimizer_machine_${m.id}`);
-                localStorage.removeItem(`optimizer_machine_type_${m.id}`);
                 localStorage.removeItem(`optimizer_machine_locked_${m.id}`);
             }
         });
@@ -1347,14 +1158,12 @@ export default function ModuleInventoryUI() {
         setMachines(preservedMachines);
     };
 
-    // The copy takes the settings and machine type but starts with an empty board, since a module cannot stand on two machines
+    // The copy takes the settings, kind and label but starts with an empty board, since a module cannot stand on two machines
     const handleDuplicateMachine = useCallback((machineId: string) => {
-        const machine = machinesRef.current[machineId];
-        if (!machine) return;
+        const saved = readStoredJson<object>(`optimizer_machine_${machineId}`);
+        if (!saved) return;
         const newId = newMachineId();
-        localStorage.setItem(`optimizer_machine_${newId}`, JSON.stringify(machine.getState()));
-        const machineType = localStorage.getItem(`optimizer_machine_type_${machineId}`);
-        if (machineType) localStorage.setItem(`optimizer_machine_type_${newId}`, machineType);
+        localStorage.setItem(`optimizer_machine_${newId}`, JSON.stringify({ ...saved, boardIds: undefined }));
         setMachines(prev => [...prev, { id: newId }]);
     }, []);
 
@@ -1362,7 +1171,6 @@ export default function ModuleInventoryUI() {
         setMachines(prev => prev.filter(m => m.id !== machineId));
         delete machinesRef.current[machineId];
         localStorage.removeItem(`optimizer_machine_${machineId}`);
-        localStorage.removeItem(`optimizer_machine_type_${machineId}`);
         localStorage.removeItem(`optimizer_machine_locked_${machineId}`);
     }, []);
 
@@ -1680,7 +1488,7 @@ export default function ModuleInventoryUI() {
                             <option value={4}>Size 4</option>
                             <option value={5}>Size 5</option>
                         </select>
-                        <select value={filterMachine} onChange={(e) => setFilterMachine(e.target.value)} style={{ flex: 1, minWidth: '150px', padding: '8px 12px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none' }}>
+                        <select value={filterMachine} onChange={(e) => setFilterMachine(e.target.value as MachineFilter)} style={{ flex: 1, minWidth: '150px', padding: '8px 12px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none' }}>
                             <option value="All">All Machines</option>
                             <option value="None">No Machine Restriction</option>
                             {MACHINE_FILTER_OPTIONS.map(name => <option key={name} value={name}>{name}</option>)}
@@ -1748,7 +1556,7 @@ export default function ModuleInventoryUI() {
 
                     {/* Inventory Filters */}
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '10px' }}>
-                        <select value={invFilterGroup} onChange={(e) => setInvFilterGroup(e.target.value as FilterGroup | 'Placed' | 'NotPlaced')} style={{ flex: 1, minWidth: '110px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
+                        <select value={invFilterGroup} onChange={(e) => setInvFilterGroup(e.target.value as InventoryGroupFilter)} style={{ flex: 1, minWidth: '110px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
                             <option value="All">All Groups</option>
                             <option value="Placed">Placed in Machine</option>
                             <option value="NotPlaced">Not Placed in Machine</option>
@@ -1768,7 +1576,7 @@ export default function ModuleInventoryUI() {
                             <option value="All">All Effects</option>
                             {EFFECTS_LIST.map(eff => <option key={eff} value={eff}>{eff === 'None' ? 'No Effect' : eff}</option>)}
                         </select>
-                        <select value={invFilterMachine} onChange={(e) => setInvFilterMachine(e.target.value)} style={{ flex: 1, minWidth: '120px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
+                        <select value={invFilterMachine} onChange={(e) => setInvFilterMachine(e.target.value as MachineFilter)} style={{ flex: 1, minWidth: '120px', padding: '6px', backgroundColor: '#333', color: 'white', border: '1px solid #555', borderRadius: '4px', outline: 'none', fontSize: '0.8em' }}>
                             <option value="All">All Machines</option>
                             <option value="None">No Machine Restriction</option>
                             {MACHINE_FILTER_OPTIONS.map(name => <option key={name} value={name}>{name}</option>)}

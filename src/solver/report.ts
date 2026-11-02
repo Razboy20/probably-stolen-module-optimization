@@ -1,5 +1,5 @@
 import type { Stats } from '../types';
-import type { Board } from './board';
+import { type Board, layoutOf } from './board';
 import { calculateBoardStats } from './boardStats';
 import { generateCodeFromState, inventoryForCode } from './codec';
 import { fromIndexBoard } from './indexBoard';
@@ -25,7 +25,7 @@ const buildBoardUpdate = (request: SolveRequest, setup: SolveSetup, machineIndex
     const { fullInventory } = request;
     const board = fromIndexBoard(boardOfSet(record, machineIndex), setup.tables.items);
     const code = generateCodeFromState(
-        machine.tier, machine.maximizeStats, machine.targetStats, inventoryForCode(fullInventory, board), board
+        layoutOf(machine.kind, machine.tier), machine.maximizeStats, machine.targetStats, inventoryForCode(fullInventory, board), board
     );
     const { totals, pieceStats } = calculateBoardStats(board, fullInventory, setup.inventoryById, setup.tables.internal);
     return { board, totals, pieceStats, code };

@@ -17,23 +17,23 @@ export interface BenchMachine {
 }
 
 const machineConfig = (id: string, benchCase: number): MachineConfig => benchCase === 0 ? {
-    id, tier: 3,
+    id, tier: 3, kind: null,
     targetStats: { Performance: null, Quality: null, Efficiency: null },
     maximizeStats: { Performance: true, Quality: true, Efficiency: true },
 } : benchCase === 1 ? {
-    id, tier: 3,
+    id, tier: 3, kind: null,
     targetStats: { Performance: 200, Quality: 80, Efficiency: null },
     maximizeStats: { Performance: false, Quality: true, Efficiency: true },
     ignoreStats: { Performance: false, Quality: false, Efficiency: false },
     statPriority: { Performance: 1, Quality: 2, Efficiency: 3 },
 } : benchCase === 2 ? {
-    id, tier: 3,
+    id, tier: 3, kind: null,
     targetStats: { Performance: 600, Quality: 60, Efficiency: null },
     maximizeStats: { Performance: false, Quality: false, Efficiency: true },
     ignoreStats: { Performance: false, Quality: false, Efficiency: false },
     statPriority: { Performance: 1, Quality: 2, Efficiency: 3 },
 } : {
-    id, tier: 3,
+    id, tier: 3, kind: null,
     targetStats: { Performance: 600, Quality: null, Efficiency: null },
     maximizeStats: { Performance: false, Quality: true, Efficiency: true },
 };

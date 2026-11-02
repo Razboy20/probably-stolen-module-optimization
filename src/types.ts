@@ -1,4 +1,7 @@
+import type { MACHINE_KINDS } from './constants';
+
 export type GridTier = 1 | 2 | 3;
+export type MachineKind = typeof MACHINE_KINDS[number];
 export type ModuleColor =
     'White'
     | 'Red'
@@ -50,7 +53,7 @@ export interface ModuleTemplate {
     shapeType: string;
     displayName: string;
     group: FilterGroup;
-    allowedMachines?: string[];
+    allowedMachines?: MachineKind[];
 }
 
 export interface Stats {

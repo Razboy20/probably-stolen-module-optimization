@@ -1,12 +1,11 @@
-import type { GridTier, Stats, TargetStats } from '../types';
+import type { GridTier, MachineKind, Stats, TargetStats } from '../types';
 import type { BoardTotals } from './boardTotals';
 import type { ScoringParams } from './scoring';
 
 export type MachineConfig = {
     id: string;
     tier: GridTier;
-    // Absent means the machine takes any module
-    machineType?: string;
+    kind: MachineKind | null;
     targetStats: TargetStats;
     maximizeStats: Record<keyof Stats, boolean>;
     ignoreStats?: Partial<Record<keyof Stats, boolean>>;

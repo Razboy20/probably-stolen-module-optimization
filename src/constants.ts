@@ -1,4 +1,4 @@
-import type {ModuleShape, ModuleColor, ItemEffect, ModuleTemplate} from './types';
+import type {ModuleShape, ModuleColor, ItemEffect, MachineKind, ModuleTemplate} from './types';
 
 export const SHAPE_DEFINITIONS: { [key in ModuleShape]: number[][] } = {
     Node1x2: [[1], [1]],
@@ -30,11 +30,9 @@ export const COLOR_MAP: { [key in ModuleColor]: string } = {
     DarkPurple: '#4a148c'
 };
 
-export const STANDARD_GRID_SIZE = {rows: 5, cols: 7};
-export const EVAPORATOR_GRID_SIZE = {rows: 4, cols: 4};
-export const getGridSize = (isEvaporator: boolean) => (isEvaporator ? EVAPORATOR_GRID_SIZE : STANDARD_GRID_SIZE);
+export const MACHINE_KINDS = ['Moisture Farm', 'Furnace', 'Water Purifier', 'Alarm System', 'AgeWell', 'Cryptographic Desequencer', 'Mirage Projector', 'Evaporator', 'Hydroponic System', '3D Printer', 'DNA Manipulator'] as const;
 
-export const MACHINE_GROUP_ORDER: string[] = ['Alarm System', 'Furnace', 'Evaporator', 'Hydroponic System', 'DNA Manipulator', '3D Printer'];
+export const MACHINE_GROUP_ORDER: MachineKind[] = ['Alarm System', 'Furnace', 'Evaporator', 'Hydroponic System', 'DNA Manipulator', '3D Printer'];
 
 export const EFFECTS_LIST: ItemEffect[] = [
     'None', 'Premium', 'Inferior', 'Overcharged', 'Degrading',

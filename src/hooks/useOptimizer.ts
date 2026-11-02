@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
-import type { GridTier, InventoryItem, Stats, TargetStats, Point } from '../types';
-import { type Board, initializeBoard } from '../solver/board';
+import type { GridTier, InventoryItem, MachineKind, Stats, TargetStats, Point } from '../types';
+import { type Board, type GridLayout, initializeBoard, layoutOf } from '../solver/board';
 import { calculateBoardStats, indexInventoryById } from '../solver/boardStats';
 import { decodeSolution, generateCodeFromState, inventoryForCode } from '../solver/codec';
 import type { BoardUpdate } from '../solver/report';
 import { isLockedModule } from '../solver/locked';
-import { getMachineTypeName, isEvaporatorMachine, isModuleAllowedInMachine } from '../utils';
+import { isModuleAllowedInMachine } from '../utils';
 
 export type StatFlags = Record<keyof Stats, boolean>;
 export type StatRanks = Record<keyof Stats, number>;
@@ -19,9 +19,6 @@ export function useOptimizer(
     defaultTier: GridTier = 3,
     isAnySolving: boolean = false
 ) {
-    const [machineType, setMachineType] = useState(() => localStorage.getItem(`optimizer_machine_type_${machineId}`) || '');
-    const isEvaporator = isEvaporatorMachine(machineType);
-
     const getSavedState = () => {
         const saved = localStorage.getItem(`optimizer_machine_${machineId}`);
         if (saved) {
@@ -47,12 +44,16 @@ export function useOptimizer(
         return defaultTier;
     });
 
+    const [kind, setKind] = useState<MachineKind | null>(savedState?.kind ?? null);
+    const [label, setLabel] = useState<string>(savedState?.label ?? '');
+    const layout = layoutOf(kind, tier);
+
     const [targetStats, setTargetStats] = useState<TargetStats>(savedState?.targetStats ?? { Performance: null, Quality: null, Efficiency: null });
     const [maximizeStats, setMaximizeStats] = useState<StatFlags>(savedState?.maximizeStats ?? { Performance: false, Quality: false, Efficiency: false });
     const [ignoreStats, setIgnoreStats] = useState<StatFlags>(savedState?.ignoreStats ?? { Performance: false, Quality: false, Efficiency: false });
     const [statPriority, setStatPriority] = useState<StatRanks>(savedState?.statPriority ?? { Performance: 1, Quality: 1, Efficiency: 1 });
 
-    const [board, setBoard] = useState<Board>(() => initializeBoard(savedState?.tier ?? defaultTier, savedState?.boardIds, inventory, isEvaporator));
+    const [board, setBoard] = useState<Board>(() => initializeBoard(layout, savedState?.boardIds, inventory));
     const boardRef = useRef(board);
     const setBoardSync = (newBoard: Board) => {
         boardRef.current = newBoard;
@@ -65,8 +66,8 @@ export function useOptimizer(
     const [warningMsg, setWarningMsg] = useState<string | null>(null);
     const [solutionCode, setSolutionCode] = useState<string>('');
 
-    const startOver = (newTier: GridTier, evaporator: boolean) => {
-        setBoardSync(initializeBoard(newTier, undefined, undefined, evaporator));
+    const startOver = (newLayout: GridLayout) => {
+        setBoardSync(initializeBoard(newLayout));
         setBestTotals({ Performance: 0, Quality: 0, Efficiency: 0 });
         setBestPieceStats(new Map());
         setWarningMsg(null);
@@ -75,22 +76,21 @@ export function useOptimizer(
 
     const handleTierChange = (newTier: GridTier) => {
         setTier(newTier);
-        startOver(newTier, isEvaporator);
+        startOver(layoutOf(kind, newTier));
     };
 
-    // Switching between an Evaporator and a standard machine changes the grid, so the board starts over; otherwise only the modules the new machine refuses come off
-    const updateMachineType = (newType: string) => {
-        if (newType === machineType) return;
-        setMachineType(newType);
-        localStorage.setItem(`optimizer_machine_type_${machineId}`, newType);
-        const nextIsEvaporator = isEvaporatorMachine(newType);
-        if (nextIsEvaporator !== isEvaporator) {
-            startOver(tier, nextIsEvaporator);
+    // A kind with another grid starts the board over; otherwise only the modules the new kind refuses come off
+    const changeMachineKind = (newKind: MachineKind, newLabel: string) => {
+        setKind(newKind);
+        setLabel(newLabel);
+        const newLayout = layoutOf(newKind, tier);
+        if (newLayout !== layout) {
+            startOver(newLayout);
             return;
         }
         const removedNames = new Set<string>();
         const next = boardRef.current.map(row => row.map(cell => {
-            if (cell && cell !== 'Locked' && !cell.isStuck && !isModuleAllowedInMachine(cell, newType)) {
+            if (cell && cell !== 'Locked' && !cell.isStuck && !isModuleAllowedInMachine(cell, newKind)) {
                 removedNames.add(cell.displayName);
                 return null;
             }
@@ -98,21 +98,15 @@ export function useOptimizer(
         }));
         if (removedNames.size > 0) {
             setBoardSync(next);
-            setWarningMsg(`Removed ${[...removedNames].join(', ')}: incompatible with ${getMachineTypeName(newType)}.`);
+            setWarningMsg(`Removed ${[...removedNames].join(', ')}: incompatible with ${newKind}.`);
         }
     };
 
-    const machineLabel = machineType ? getMachineTypeName(machineType) : 'this machine';
-    const isModuleAllowed = (item: InventoryItem) => isModuleAllowedInMachine(item, machineType);
-
-    const checkModuleAllowed = (item: InventoryItem) => {
-        if (isModuleAllowed(item)) return true;
-        setWarningMsg(`Cannot place ${item.displayName}: incompatible with ${machineLabel}.`);
-        return false;
-    };
+    const kindName = kind ?? 'this machine';
+    const isModuleAllowed = (item: InventoryItem) => isModuleAllowedInMachine(item, kind);
 
     const emptyBoard = (keepLockedModules: boolean) => {
-        const fresh = initializeBoard(tier, undefined, undefined, isEvaporator);
+        const fresh = initializeBoard(layout);
         if (keepLockedModules) {
             for (let y = 0; y < 5; y++) {
                 for (let x = 0; x < 7; x++) {
@@ -208,21 +202,34 @@ export function useOptimizer(
         return true;
     };
 
+    // A module this machine refuses is turned away with a warning; any other invalid drop is silently ignored
+    const tryPlace = (item: InventoryItem, rootX: number, rootY: number, offsets: Point[]) => {
+        if (!isModuleAllowed(item)) {
+            setWarningMsg(`Cannot place ${item.displayName}: incompatible with ${kindName}.`);
+            return false;
+        }
+        if (!isValidPlacement(item, rootX, rootY, offsets)) return false;
+        manuallyPlaceItem(item, rootX, rootY, offsets);
+        return true;
+    };
+
     const importSolution = (code: string) => {
         try {
             const decoded = decodeSolution(code);
-            if (decoded.isEvaporator !== isEvaporator) {
-                setWarningMsg(decoded.isEvaporator
+            const codeIsEvaporator = decoded.layout === 'Evaporator';
+            if (codeIsEvaporator !== (layout === 'Evaporator')) {
+                setWarningMsg(codeIsEvaporator
                     ? 'This solution code was made for an Evaporator (4x4 grid). Select an Evaporator machine to import it.'
                     : 'This solution code was made for a standard (7x5 grid) machine and cannot be imported into an Evaporator.');
                 return;
             }
-            const incompatible = new Set(decoded.board.flat().filter(cell => cell && cell !== 'Locked' && !isModuleAllowed(cell)).map(cell => (cell as InventoryItem).displayName));
+            const placed = decoded.board.flat().filter((cell): cell is InventoryItem => cell !== null && cell !== 'Locked');
+            const incompatible = new Set(placed.filter(item => !isModuleAllowed(item)).map(item => item.displayName));
             if (incompatible.size > 0) {
-                setWarningMsg(`This solution contains modules that cannot be placed in ${machineLabel}: ${[...incompatible].join(', ')}.`);
+                setWarningMsg(`This solution contains modules that cannot be placed in ${kindName}: ${[...incompatible].join(', ')}.`);
                 return;
             }
-            setTier(decoded.tier);
+            if (decoded.layout !== 'Evaporator') setTier(decoded.layout);
             setMaximizeStats(decoded.maximizeStats);
             setTargetStats(decoded.targetStats);
 
@@ -265,24 +272,24 @@ export function useOptimizer(
 
             const boardIds = boardToCalculate.map(row => row.map(c => c && c !== 'Locked' ? c.id : c));
             localStorage.setItem(`optimizer_machine_${machineId}`, JSON.stringify({
-                tier, maximizeStats, targetStats, ignoreStats, statPriority, boardIds
+                tier, kind, label, maximizeStats, targetStats, ignoreStats, statPriority, boardIds
             }));
 
             if (inventory.length > 0) {
                 const availableForCode = inventoryForCode(inventory, boardToCalculate);
-                setSolutionCode(generateCodeFromState(tier, maximizeStats, targetStats, availableForCode, boardToCalculate));
+                setSolutionCode(generateCodeFromState(layout, maximizeStats, targetStats, availableForCode, boardToCalculate));
             } else {
                 setSolutionCode('');
             }
         }
-    }, [inventory, tier, maximizeStats, targetStats, ignoreStats, statPriority, machineId, getUsedItems, board, isAnySolving]);
+    }, [inventory, tier, kind, label, layout, maximizeStats, targetStats, ignoreStats, statPriority, machineId, getUsedItems, board, isAnySolving]);
 
     return {
         tier, setTier, handleTierChange, targetStats, setTargetStats,
         maximizeStats, setMaximizeStats, ignoreStats, setIgnoreStats,
         statPriority, setStatPriority, board, bestTotals, bestPieceStats,
-        warningMsg, setWarningMsg, applyUpdate, machineType, updateMachineType, isEvaporator, checkModuleAllowed,
+        warningMsg, setWarningMsg, applyUpdate, kind, label, layout, changeMachineKind,
         solutionCode, setSolutionCode, importSolution, resetBoard, resetBoardIncludingLocked,
-        manuallyPlaceItem, manuallyRemoveItem, isValidPlacement, boardRef
+        tryPlace, manuallyRemoveItem, isValidPlacement, boardRef
     };
 }

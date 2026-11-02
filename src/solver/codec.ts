@@ -1,7 +1,8 @@
 import type { GridTier, InventoryItem, ItemEffect, ModuleColor, ModuleShape, Stats, TargetStats } from '../types';
-import { getBaseStats } from '../utils';
-import { EVAPORATOR_GRID_SIZE, MODULE_TEMPLATES, NODE_TEMPLATE, STANDARD_GRID_SIZE } from '../constants';
-import { type Board, initializeBoard, isEvaporatorBoard } from './board';
+import { getBaseStats, twoCellShapeFor } from '../utils';
+import { MODULE_TEMPLATES, NODE_TEMPLATE } from '../constants';
+import { type Board, type GridLayout, gridSizeOf, initializeBoard } from './board';
+import { BOARD_CELLS, BOARD_W } from './geometry';
 import { isLockedModule } from './locked';
 
 const SHAPE_MAP: ModuleShape[] = ['Node1x2', 'L3', 'L4_Base', 'T4_Base', 'Square4_Base', 'L4_High', 'T4_High', 'Square4_High', 'P5', 'C5', 'Line4', 'Line1x2'];
@@ -136,8 +137,11 @@ class BitReader {
 // Emit nothing rather than something corrupt.
 export const MAX_ENCODABLE_MODULES = 255;
 
+// An Evaporator has no tiers, but its code still opens with one, since a zero there marks an upstream code
+const EVAPORATOR_HEADER_TIER: GridTier = 3;
+
 export const generateCodeFromState = (
-    currentTier: GridTier,
+    layout: GridLayout,
     maxStats: Record<keyof Stats, boolean>,
     tarStats: TargetStats,
     inv: InventoryItem[],
@@ -147,7 +151,7 @@ export const generateCodeFromState = (
 
     const writer = new BitWriter();
 
-    writer.write(currentTier, 2);
+    writer.write(layout === 'Evaporator' ? EVAPORATOR_HEADER_TIER : layout, 2);
 
     writer.write(maxStats.Performance ? 1 : 0, 1);
     writer.write(maxStats.Quality ? 1 : 0, 1);
@@ -173,7 +177,7 @@ export const generateCodeFromState = (
             if (!placedItemsMap.has(cell.id)) {
                 placedItemsMap.set(cell.id, []);
             }
-            placedItemsMap.get(cell.id)!.push(y * 7 + x);
+            placedItemsMap.get(cell.id)!.push(y * BOARD_W + x);
         }
     }));
 
@@ -208,7 +212,7 @@ export const generateCodeFromState = (
 
     // Then, behind a marker of its own, the grid and what each module is beyond its shape and colour
     writer.write(1, 1);
-    writer.write(isEvaporatorBoard(brd) ? 1 : 0, 1);
+    writer.write(layout === 'Evaporator' ? 1 : 0, 1);
     inv.forEach(item => {
         writer.write(item.isStuck ? 1 : 0, 1);
         const specialIdx = SPECIAL_MODULE_IDS.indexOf(item.displayName);
@@ -238,23 +242,30 @@ export const inventoryForCode = (inventory: InventoryItem[], board: Board) => {
 
 
 export interface DecodedSolution {
-    tier: GridTier;
-    isEvaporator: boolean;
+    layout: GridLayout;
     maximizeStats: Record<keyof Stats, boolean>;
     targetStats: TargetStats;
     inventory: InventoryItem[];
     board: Board;
 }
 
+type ModuleIdentity = Pick<InventoryItem, 'shape' | 'color' | 'displayName'>;
+
+// What a code says about one module, gathered from every section before the module is built
 interface DecodedModule {
-    item: InventoryItem;
+    identity: ModuleIdentity;
     // Row-major cells of the standard grid
     positions: number[];
+    effects: [ItemEffect, ItemEffect];
+    // A Learning Algorithm or Degrading value the code carries
+    effectValues: [number | null, number | null];
+    // Absent leaves the module's own default in place
+    isLocked?: boolean;
+    isStuck?: boolean;
 }
 
 interface DecodedModules {
-    tier: GridTier;
-    isEvaporator: boolean;
+    layout: GridLayout;
     maximizeStats: Record<keyof Stats, boolean>;
     targetStats: TargetStats;
     modules: DecodedModule[];
@@ -274,34 +285,45 @@ const readPositions = (reader: BitReader) => {
     return positions;
 };
 
-const templateName = (shape: ModuleShape, color: ModuleColor) =>
-    color === 'White' ? NODE_TEMPLATE.displayName
-        : MODULE_TEMPLATES.find(m => m.shape === shape && m.color === color)?.displayName ?? 'Unknown Module';
-
-const specialTemplate = (idx: number) => {
-    const template = MODULE_TEMPLATES.find(t => t.displayName === SPECIAL_MODULE_IDS[idx]);
-    if (!template) throw new Error('Unknown special module');
-    return template;
-};
-
 // The effects close out every module in both formats
-const readModule = (reader: BitReader, shape: ModuleShape, color: ModuleColor, displayName: string): InventoryItem => {
+const readEffects = (reader: BitReader) => {
     const effects: [ItemEffect, ItemEffect] = ['None', 'None'];
-    const base = getBaseStats({ shape, color, displayName });
-    const maxPositiveBase = Math.max(base.Performance, base.Quality, base.Efficiency, 0);
-    const effectValues: [number, number] = [maxPositiveBase * 2, maxPositiveBase * 2];
-
+    const effectValues: [number | null, number | null] = [null, null];
     for (let eIdx = 0; eIdx < 2; eIdx++) {
         if (reader.read(1) !== 1) continue;
         const eff = EFFECT_MAP[reader.read(4)];
         effects[eIdx] = eff;
         const hasValue = reader.read(1) === 1;
-        if ((eff === 'Learning Algorithm' || eff === 'Degrading') && hasValue) {
-            effectValues[eIdx] = reader.read(12) - 2048;
-        }
+        if ((eff === 'Learning Algorithm' || eff === 'Degrading') && hasValue) effectValues[eIdx] = reader.read(12) - 2048;
     }
+    return { effects, effectValues };
+};
 
-    return { id: `${shape}_${color}_${Math.random().toString(36).substring(2, 8)}`, shape, color, displayName, effects, effectValues };
+const templateName = (shape: ModuleShape, color: ModuleColor) =>
+    color === 'White' ? NODE_TEMPLATE.displayName
+        : MODULE_TEMPLATES.find(m => m.shape === shape && m.color === color)?.displayName ?? 'Unknown Module';
+
+const specialIdentity = (idx: number): ModuleIdentity => {
+    const template = MODULE_TEMPLATES.find(t => t.displayName === SPECIAL_MODULE_IDS[idx]);
+    if (!template) throw new Error('Unknown special module');
+    return { shape: template.shape, color: template.color, displayName: template.displayName };
+};
+
+const legacyIdentity = (shapeIdx: number, colorIdx: number): ModuleIdentity => {
+    const isBlast = shapeIdx === SHAPE_MAP.indexOf('Line4') && colorIdx === BLAST_COLOR_INDEX;
+    const shape = SHAPE_MAP[shapeIdx];
+    const color = isBlast ? 'Grey' : COLOR_MAP_KEYS[colorIdx];
+    if (shape === undefined || color === undefined) throw new Error('Invalid module');
+    return { shape, color, displayName: isBlast ? BLAST_NAME : templateName(shape, color) };
+};
+
+const upstreamIdentity = (reader: BitReader): ModuleIdentity => {
+    if (reader.read(1) === 1) return specialIdentity(reader.read(6));
+    const codedShape = UPSTREAM_SHAPE_MAP[reader.read(4)];
+    const color = UPSTREAM_COLOR_MAP[reader.read(4)];
+    if (codedShape === undefined || color === undefined) throw new Error('Invalid module');
+    const shape = twoCellShapeFor(codedShape, color);
+    return { shape, color, displayName: templateName(shape, color) };
 };
 
 const decodeOwnFormat = (reader: BitReader, tier: GridTier): DecodedModules => {
@@ -310,93 +332,82 @@ const decodeOwnFormat = (reader: BitReader, tier: GridTier): DecodedModules => {
     const numModules = reader.read(8);
 
     for (let i = 0; i < numModules; i++) {
-        const shapeIdx = reader.read(4);
-        const colorIdx = reader.read(3);
-        const isBlast = shapeIdx === SHAPE_MAP.indexOf('Line4') && colorIdx === BLAST_COLOR_INDEX;
-        const shape = SHAPE_MAP[shapeIdx];
-        const color = isBlast ? 'Grey' : COLOR_MAP_KEYS[colorIdx];
-        if (shape === undefined || color === undefined) throw new Error('Invalid module');
-
+        const identity = legacyIdentity(reader.read(4), reader.read(3));
         const positions = readPositions(reader);
-        const item = readModule(reader, shape, color, isBlast ? BLAST_NAME : templateName(shape, color));
-        modules.push({ item, positions });
+        modules.push({ identity, positions, ...readEffects(reader) });
     }
 
     if (reader.hasBits(1 + numModules) && reader.read(1) === 1) {
-        for (const { item } of modules) item.isLocked = reader.read(1) === 1;
+        for (const module of modules) module.isLocked = reader.read(1) === 1;
     }
 
     let isEvaporator = false;
     if (reader.hasBits(2 + 2 * numModules) && reader.read(1) === 1) {
         isEvaporator = reader.read(1) === 1;
-        for (const { item } of modules) {
-            if (reader.read(1) === 1) item.isStuck = true;
-            if (reader.read(1) === 1) {
-                const template = specialTemplate(reader.read(6));
-                item.shape = template.shape;
-                item.color = template.color;
-                item.displayName = template.displayName;
-            }
+        for (const module of modules) {
+            module.isStuck = reader.read(1) === 1;
+            if (reader.read(1) === 1) module.identity = specialIdentity(reader.read(6));
         }
     }
 
-    return { tier, isEvaporator, maximizeStats, targetStats, modules };
+    return { layout: isEvaporator ? 'Evaporator' : tier, maximizeStats, targetStats, modules };
 };
 
 const decodeUpstreamFormat = (reader: BitReader): DecodedModules => {
     if (reader.read(4) !== UPSTREAM_CODE_VERSION) throw new Error('Unsupported code version');
     const isEvaporator = reader.read(1) === 1;
     const tier = reader.read(2) as GridTier;
+    const layout: GridLayout = isEvaporator ? 'Evaporator' : tier;
     const { maximizeStats, targetStats } = readObjective(reader);
-    const cols = isEvaporator ? EVAPORATOR_GRID_SIZE.cols : STANDARD_GRID_SIZE.cols;
+    // Upstream numbers cells across the machine's own grid width
+    const { cols } = gridSizeOf(layout);
     const modules: DecodedModule[] = [];
     const numModules = reader.read(8);
 
     for (let i = 0; i < numModules; i++) {
-        let shape: ModuleShape;
-        let color: ModuleColor;
-        let displayName: string;
-        if (reader.read(1) === 1) {
-            ({ shape, color, displayName } = specialTemplate(reader.read(6)));
-        } else {
-            shape = UPSTREAM_SHAPE_MAP[reader.read(4)];
-            color = UPSTREAM_COLOR_MAP[reader.read(4)];
-            if (shape === undefined || color === undefined) throw new Error('Invalid module');
-            if (shape === 'Node1x2' && color !== 'White') shape = 'Line1x2';
-            displayName = templateName(shape, color);
-        }
-
-        // Upstream numbers cells across the machine's own grid width
-        const positions = readPositions(reader).map(pos => Math.floor(pos / cols) * STANDARD_GRID_SIZE.cols + pos % cols);
-        const isLocked = reader.read(1) === 1;
-        const isStuck = reader.read(1) === 1;
-        const item = readModule(reader, shape, color, displayName);
+        const identity = upstreamIdentity(reader);
+        const positions = readPositions(reader).map(pos => Math.floor(pos / cols) * BOARD_W + pos % cols);
         // Upstream never hands a special to its optimizer, so an unset lock bit leaves the special's own default in place
-        if (isLocked) item.isLocked = true;
-        if (isStuck) item.isStuck = true;
-        modules.push({ item, positions });
+        const isLocked = reader.read(1) === 1 ? true : undefined;
+        const isStuck = reader.read(1) === 1;
+        modules.push({ identity, positions, isLocked, isStuck, ...readEffects(reader) });
     }
 
-    return { tier, isEvaporator, maximizeStats, targetStats, modules };
+    return { layout, maximizeStats, targetStats, modules };
+};
+
+// A Learning Algorithm or Degrading effect the code gives no value for starts at its most
+const toInventoryItem = ({ identity, effects, effectValues, isLocked, isStuck }: DecodedModule): InventoryItem => {
+    const { shape, color, displayName } = identity;
+    const base = getBaseStats(identity);
+    const fullValue = Math.max(base.Performance, base.Quality, base.Efficiency, 0) * 2;
+    return {
+        id: `${shape}_${color}_${Math.random().toString(36).substring(2, 8)}`,
+        shape, color, displayName, effects,
+        effectValues: [effectValues[0] ?? fullValue, effectValues[1] ?? fullValue],
+        ...(isLocked !== undefined && { isLocked }),
+        ...(isStuck && { isStuck })
+    };
 };
 
 export const decodeSolution = (code: string): DecodedSolution => {
     const reader = new BitReader(code);
     const header = reader.read(2);
-    const { tier, isEvaporator, maximizeStats, targetStats, modules } = header === 0
+    const { layout, maximizeStats, targetStats, modules } = header === 0
         ? decodeUpstreamFormat(reader)
         : decodeOwnFormat(reader, header as GridTier);
 
-    const board = initializeBoard(tier, undefined, undefined, isEvaporator);
-    const cells = STANDARD_GRID_SIZE.rows * STANDARD_GRID_SIZE.cols;
-    for (const { item, positions } of modules) {
+    const board = initializeBoard(layout);
+    const inventory = modules.map(toInventoryItem);
+    modules.forEach(({ positions }, i) => {
         for (const pos of positions) {
-            const y = Math.floor(pos / STANDARD_GRID_SIZE.cols);
-            const x = pos % STANDARD_GRID_SIZE.cols;
-            if (pos >= cells || board[y][x] === 'Locked') throw new Error('Invalid position');
-            board[y][x] = item;
+            if (pos >= BOARD_CELLS) throw new Error('Invalid position');
+            const y = Math.floor(pos / BOARD_W);
+            const x = pos % BOARD_W;
+            if (board[y][x] === 'Locked') throw new Error('Invalid position');
+            board[y][x] = inventory[i];
         }
-    }
+    });
 
-    return { tier, isEvaporator, maximizeStats, targetStats, inventory: modules.map(m => m.item), board };
+    return { layout, maximizeStats, targetStats, inventory, board };
 };

@@ -1,6 +1,7 @@
 import type { InventoryItem, ItemEffect, Stats } from '../types';
 import { applyInternalEffects, roundStat } from '../utils';
-import { type Board, NEIGHBOR_DX, NEIGHBOR_DY } from './board';
+import type { Board } from './board';
+import { NEIGHBOR_DX, NEIGHBOR_DY } from './geometry';
 
 // effects is a fixed 2-slot tuple
 // counting it directly avoids the closure + intermediate array that Array.prototype.filter allocates on every call.

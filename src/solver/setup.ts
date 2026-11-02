@@ -61,8 +61,7 @@ const targetCap = (machineCount: number) => Math.min(MAX_TARGET, Math.floor(2 **
 const prepareMachine = (tables: PoolTables, searchPoolInventory: InventoryItem[], { machine, initialBoard }: MachineRequest, cap: number, rankOrder: number[]): MachineSetup => {
     // Boards may already hold modules the search itself would not pick up, so the pruned pool is only used for choosing what to place
     // A module made for other machines is never drawn here, but a board of its own kind in the set may still take it
-    const { machineType } = machine;
-    const allowedInventory = machineType === undefined ? searchPoolInventory : searchPoolInventory.filter(item => isModuleAllowedInMachine(item, machineType));
+    const allowedInventory = searchPoolInventory.filter(item => isModuleAllowedInMachine(item, machine.kind));
     const searchPool = buildSearchPool(allowedInventory, tables.internal, machine).filter(item => tables.indexOf.has(item.id));
     const draw = layoutDraw(tables, Int32Array.from(searchPool, item => tables.indexOf.get(item.id)!));
 

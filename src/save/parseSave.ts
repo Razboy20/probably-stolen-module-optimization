@@ -1,11 +1,15 @@
-import { PRECOMPUTED_OFFSETS, getBaseStats, isFixedStatModule } from '../utils';
-import { MODULE_TEMPLATES, STANDARD_GRID_SIZE, getGridSize } from '../constants';
-import type { InventoryItem, ModuleShape, ItemEffect, ModuleColor, Point, GridTier } from '../types';
+import { PRECOMPUTED_OFFSETS, getBaseStats, isFixedStatModule, twoCellShapeFor } from '../utils';
+import { MODULE_TEMPLATES } from '../constants';
+import { gridSizeOf, layoutOf } from '../solver/board';
+import { BOARD_H, BOARD_W } from '../solver/geometry';
+import type { InventoryItem, ModuleShape, ItemEffect, ModuleColor, Point, GridTier, MachineKind } from '../types';
 
 export interface ImportedMachine {
     id: string;
     boardIds: (string | null)[][];
-    machineType: string;
+    kind: MachineKind;
+    // Where the machine sits in the save, ending in the name the player gave it
+    label: string;
     tier: GridTier;
 }
 
@@ -176,49 +180,40 @@ const isModule = (item: SaveItem): boolean => {
     return types.includes('MODULE') || types.includes('NODE') || hasModuleName(item);
 };
 
-const MACHINE_NAMES: [string, string][] = [
-    ['purifier', 'Water Purifier'],
-    ['furnace', 'Furnace'],
-    ['moisture_farm', 'Moisture Farm'],
-    ['wine_rack', 'AgeWell'],
-    ['mirage_projector', 'Mirage Projector'],
-    ['desequencer', 'Cryptographic Desequencer'],
-    ['evaporator', 'Evaporator'],
-    ['hydroponic', 'Hydroponic System'],
-    ['printer', '3D Printer'],
-    ['dna', 'DNA Manipulator'],
-    ['alarm', 'Alarm System'],
+// The keyword each machine's game identifier holds, and the one its English name holds, checked in this order
+const MACHINE_KEYWORDS: { kind: MachineKind, identifier: string, name: string }[] = [
+    { kind: 'Water Purifier', identifier: 'purifier', name: 'purifier' },
+    { kind: 'Furnace', identifier: 'furnace', name: 'furnace' },
+    { kind: 'Moisture Farm', identifier: 'moisture_farm', name: 'farm' },
+    { kind: 'AgeWell', identifier: 'wine_rack', name: 'agewell' },
+    { kind: 'Mirage Projector', identifier: 'mirage_projector', name: 'projector' },
+    { kind: 'Cryptographic Desequencer', identifier: 'desequencer', name: 'desequencer' },
+    { kind: 'Evaporator', identifier: 'evaporator', name: 'evaporator' },
+    { kind: 'Hydroponic System', identifier: 'hydroponic', name: 'hydroponic' },
+    { kind: '3D Printer', identifier: 'printer', name: '3d printer' },
+    { kind: 'DNA Manipulator', identifier: 'dna', name: 'dna' },
+    { kind: 'Alarm System', identifier: 'alarm', name: 'alarm' },
 ];
 
-const machineNameFromIdentifier = (identifier: string): string | null =>
-    MACHINE_NAMES.find(([keyword]) => identifier.includes(keyword))?.[1] ?? null;
+const machineKindFromIdentifier = (identifier: string): MachineKind | null =>
+    MACHINE_KEYWORDS.find(m => identifier.includes(m.identifier))?.kind ?? null;
 
-const machineNameFromName = (name: string): string | null => {
+// Storage that happens to share a keyword with a machine is not one
+const machineKindFromName = (name: string): MachineKind | null => {
     const lower = name.toLowerCase();
     if (lower.includes("bay") || lower.includes("box") || lower.includes("crate")) return null;
-    if (lower.includes("purifier")) return "Water Purifier";
-    if (lower.includes("furnace")) return "Furnace";
-    if (lower.includes("farm")) return "Moisture Farm";
-    if (lower.includes("agewell")) return "AgeWell";
-    if (lower.includes("projector")) return "Mirage Projector";
-    if (lower.includes("desequencer")) return "Cryptographic Desequencer";
-    if (lower.includes("evaporator")) return "Evaporator";
-    if (lower.includes("hydroponic")) return "Hydroponic System";
-    if (lower.includes("3d printer")) return "3D Printer";
-    if (lower.includes("dna")) return "DNA Manipulator";
-    if (lower.includes("alarm")) return "Alarm System";
-    return null;
+    return MACHINE_KEYWORDS.find(m => lower.includes(m.name))?.kind ?? null;
 };
 
 // Only machines with a module grid count; power blocks and rechargers are machines too
-const moduleMachineName = (item: SaveItem): string | null => {
+const moduleMachineKind = (item: SaveItem): MachineKind | null => {
     const typesStr = item.itemTypes?.join(' ').toLowerCase() || '';
     const keysStr = (item._keys || []).join(' ').toLowerCase();
 
     const isMachine = typesStr.includes("machine") || keysStr.includes("standard_machine_tag") || keysStr.includes("machinery");
     if (!isMachine) return null;
 
-    return machineNameFromIdentifier(item.identifier || '') ?? machineNameFromName(item.name || '');
+    return machineKindFromIdentifier(item.identifier || '') ?? machineKindFromName(item.name || '');
 };
 
 const getShapeFromData = (width: number, data: number[], isHighTier: boolean, blocks: number): ModuleShape | null => {
@@ -401,15 +396,6 @@ const isStuckModule = (item: SaveItem, displayName: string): boolean => {
     return tags.some(tag => tag.toUpperCase().includes('STUCK'));
 };
 
-// The machine's path ends in its own name, which may be a custom one or a localized one;
-// the machine type it really is goes after it in parentheses, where getMachineTypeName looks for it
-const machineTypeLabel = (path: string, machineName: string | undefined): string => {
-    if (!path) return machineName || "Select Machine...";
-    if (!machineName) return path;
-    const lastSegment = path.split('>').pop()!.toLowerCase();
-    return lastSegment.includes(machineName.toLowerCase()) ? path : `${path} (${machineName})`;
-};
-
 export const parseSaveFile = (raw: string): ImportedSave => {
     const saveItems = readSaveItems(raw);
 
@@ -432,13 +418,13 @@ export const parseSaveFile = (raw: string): ImportedSave => {
     const items: InventoryItem[] = [];
     const machines: ImportedMachine[] = [];
     const machineContents = new Map<number, { invId: string, modifiedShape: SaveShape }[]>();
-    const machineNames = new Map<number, string>();
+    const machineKinds = new Map<number, MachineKind>();
 
     saveItems.forEach(item => {
-        const machineName = moduleMachineName(item);
-        if (machineName === null) return;
+        const kind = moduleMachineKind(item);
+        if (kind === null) return;
         machineContents.set(item.uuid, []);
-        machineNames.set(item.uuid, machineName);
+        machineKinds.set(item.uuid, kind);
     });
 
     saveItems.forEach(item => {
@@ -460,8 +446,7 @@ export const parseSaveFile = (raw: string): ImportedSave => {
             else if (blocks === 4) shape = isHighTier ? 'L4_High' : 'L4_Base';
             else shape = 'P5';
         }
-        // A two-cell piece is only a Node when it is white; the coloured ones are two-cell specials
-        if (shape === 'Node1x2' && color !== 'White') shape = 'Line1x2';
+        shape = twoCellShapeFor(shape, color);
 
         const [eff1, eff2]: [ItemEffect, ItemEffect] = isFixedStatModule({ displayName }) ? ['None', 'None'] : readEffects(item);
 
@@ -504,18 +489,19 @@ export const parseSaveFile = (raw: string): ImportedSave => {
     });
 
     machineContents.forEach((contents, machineId) => {
-        const machineName = machineNames.get(machineId);
-        const grid = getGridSize(machineName === 'Evaporator');
-        const boardIds = Array.from({ length: STANDARD_GRID_SIZE.rows }, () => Array.from({ length: STANDARD_GRID_SIZE.cols }, () => null as string | null));
-        contents.forEach(({ invId, modifiedShape }) => placeOnBoard(boardIds, invId, modifiedShape, grid));
-
+        const kind = machineKinds.get(machineId)!;
         const machine = itemMap.get(machineId);
+        const tier = machine ? readMachineTier(machine) : 1;
+        const grid = gridSizeOf(layoutOf(kind, tier));
+        const boardIds = Array.from({ length: BOARD_H }, () => Array.from({ length: BOARD_W }, () => null as string | null));
+        contents.forEach(({ invId, modifiedShape }) => placeOnBoard(boardIds, invId, modifiedShape, grid));
 
         machines.push({
             id: `m_${Math.random().toString(36).substring(2, 8)}`,
             boardIds,
-            machineType: machineTypeLabel(buildPath(machineId, itemMap, parentMap), machineName),
-            tier: machine ? readMachineTier(machine) : 1
+            kind,
+            label: buildPath(machineId, itemMap, parentMap) || kind,
+            tier
         });
     });
 

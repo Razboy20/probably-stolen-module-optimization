@@ -1,4 +1,4 @@
-import type {ModuleShape, ModuleColor, Stats, Point, InventoryItem, ModuleTemplate} from './types';
+import type {ModuleShape, ModuleColor, Stats, Point, InventoryItem, MachineKind, ModuleTemplate} from './types';
 import {SHAPE_DEFINITIONS, MODULE_TEMPLATES, MACHINE_GROUP_ORDER} from './constants';
 
 const STAT_EPSILON = 1e-9;
@@ -248,25 +248,19 @@ export const compareTemplatesByMachine = (a: ModuleTemplate, b: ModuleTemplate) 
     return rankA >= 0 ? a.size - b.size : 0;
 };
 
-export const getMachineTypeName = (machineType: string) => {
-    const segments = machineType.split('>');
-    const last = segments[segments.length - 1].trim();
-    const match = last.match(/\(([^()]*)\)\s*$/);
-    return match ? match[1] : last;
-};
-
+// A machine of no known kind takes only the modules every machine takes
 export const isModuleAllowedInMachine = (item: {
     displayName: string,
     shape: ModuleShape,
     color: ModuleColor
-}, machineType: string): boolean => {
+}, kind: MachineKind | null): boolean => {
     const allowedMachines = getModuleTemplate(item)?.allowedMachines;
-    if (!allowedMachines || allowedMachines.length === 0) return true;
-    const typeName = getMachineTypeName(machineType).toLowerCase();
-    return allowedMachines.some(allowed => typeName.includes(allowed.toLowerCase()));
+    return !allowedMachines?.length || (kind !== null && allowedMachines.includes(kind));
 };
 
-export const isEvaporatorMachine = (machineType: string) => getMachineTypeName(machineType).toLowerCase().includes('evaporator');
+// A two-cell piece is only a Node when it is white; the coloured ones are two-cell specials
+export const twoCellShapeFor = (shape: ModuleShape, color: ModuleColor): ModuleShape =>
+    shape === 'Node1x2' && color !== 'White' ? 'Line1x2' : shape;
 
 const rotateMatrix = (m: number[][]) => m[0].map((_, idx) => m.map(row => row[idx]).reverse());
 const flipMatrix = (m: number[][]) => m.map(row => [...row].reverse());
