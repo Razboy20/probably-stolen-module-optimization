@@ -8,7 +8,7 @@ import {
 import { EMPTY } from '../indexBoard';
 import { DENSITY_TIER_WEIGHT, TIER_VECTOR_LENGTH } from '../objective';
 import type { SolveSetup } from '../setup';
-import { FLAG_FIXED, FLAG_PURE_NEGATIVE, FLAG_RECEIVER, FLAG_SIDE_MOUNT, FLAG_TOP_MOUNT, FLAG_WHITE, NF_SHIFT, RECV_MAX_NODES } from '../tables';
+import { FLAG_FIXED, FLAG_PURE_NEGATIVE, FLAG_STUCK, FLAG_RECEIVER, FLAG_SIDE_MOUNT, FLAG_TOP_MOUNT, FLAG_WHITE, NF_SHIFT, RECV_MAX_NODES } from '../tables';
 import {
     GEO_CELL_COUNT, GEO_CELLS, GEO_LENGTH, GEO_MASK_HI, GEO_MASK_LO, GEO_META, GEO_NBR_COUNT, GEO_NBRS, GEO_ORIENT_CELL_COUNT, GEO_ORIENT_CORNERS_HI,
     GEO_ORIENT_CORNERS_LO, GEO_ORIENT_COUNT, GEO_ORIENT_OFFSETS, GEO_ORIENT_START, GEO_SCAN_STRIDES,
@@ -522,7 +522,7 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         }
     };
 
-    // Returns how many fixed pieces the board holds; every piece, fixed or not, is recorded in blocked and removable
+    // Returns how many fixed pieces the board holds; every piece is recorded in blocked, and every one but the stuck ones in removable
     const scanBoard = () => {
         'use gpu';
         s.removableCount.$ = 0;
@@ -530,6 +530,10 @@ export const createSearchKernel = (root: TgpuRoot, setup: SolveSetup, seed: numb
         for (let i = 0; i < BOARD_CELLS; i++) {
             const item = s.test.$[i];
             if (item < 0) continue;
+            if ((pool.$[item].flags & FLAG_STUCK) !== 0) {
+                s.setBit(item);
+                continue;
+            }
             if ((pool.$[item].flags & FLAG_FIXED) !== 0) {
                 let f = 0;
                 while (f < fixedCount && s.fixedItem.$[f] !== item) f = f + 1;

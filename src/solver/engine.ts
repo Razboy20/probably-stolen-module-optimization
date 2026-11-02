@@ -11,7 +11,7 @@ import { MAX_PIECES_PER_BOARD } from './pool';
 import { buildUpdate, type SolveUpdate } from './report';
 import { randomSeed, type Rng, rngBelow, rngCoinFlip, seedRng } from './rng';
 import { boardOfSet, prepareSolve, type SolveRequest } from './setup';
-import { FLAG_FIXED } from './tables';
+import { FLAG_FIXED, FLAG_STUCK } from './tables';
 import { createYielder, FRAME_BUDGET_MS, now, TIMER_YIELD_INTERVAL_MS } from './yielder';
 
 // How many perturbations in a row the search rides out without a new record before it goes back to the record board
@@ -496,12 +496,16 @@ export const runOptimizationEngine = async (
             offered = -1;
             if (stealableCount > 0 && !isStagnant && rngBelow(rng, STEAL_ONE_IN) === 0) offerForSteal(stealableCount);
 
-            // Fixed pieces take their share of the ruin like any other, and the ones it lifts are repacked instead of left to the draw
+            // Fixed pieces take their share of the ruin like any other, and the ones it lifts are repacked instead of left to the draw; stuck pieces are kept out of it
             let removableCount = 0;
             let fixedCount = 0;
             for (let i = 0; i < BOARD_CELLS; i++) {
                 const item = testBoard[i];
                 if (item < 0) continue;
+                if ((tables.flags[item] & FLAG_STUCK) !== 0) {
+                    setBit(blocked, item);
+                    continue;
+                }
 
                 if ((tables.flags[item] & FLAG_FIXED) !== 0) {
                     let f = 0;

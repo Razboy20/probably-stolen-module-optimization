@@ -14,6 +14,8 @@ export const FLAG_FIXED = 16;
 export const FLAG_PURE_NEGATIVE = 32;
 export const NF_SHIFT = 6;
 export const nfCountOf = (flags: number) => (flags >> NF_SHIFT) & 3;
+// A stuck module is also fixed, and the search does not move it at all
+export const FLAG_STUCK = 256;
 
 export const RECV_MAX_NODES = MAX_PIECE_NEIGHBORS;
 const RECV_STRIDE = RECV_MAX_NODES + 1;
@@ -95,6 +97,7 @@ export const buildPoolTables = (inventory: InventoryItem[], boards: Board[]): Po
         if (item.effects.includes('Top Mount')) f |= FLAG_TOP_MOUNT;
         if (item.effects.includes('Receiver')) f |= FLAG_RECEIVER;
         if (isLockedModule(item)) f |= FLAG_FIXED;
+        if (item.isStuck) f |= FLAG_STUCK;
         if (ip <= 0 && iq <= 0 && ie <= 0 && (ip < 0 || iq < 0 || ie < 0)) f |= FLAG_PURE_NEGATIVE;
         f |= countEffect(item, 'Negative Feedback') << NF_SHIFT;
         flags[i] = f;
