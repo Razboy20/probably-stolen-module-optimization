@@ -1,9 +1,8 @@
 import React, { useRef, useState } from 'react';
-import { parseSaveFile, type ImportedMachine } from '../save/parseSave';
-import type { InventoryItem } from '../types';
+import { parseSaveFile, type ImportedSave } from '../save/parseSave';
 
 interface SaveFileImporterProps {
-    onImport: (newItems: InventoryItem[], newMachines: ImportedMachine[]) => void;
+    onImport: (save: ImportedSave) => void;
 }
 
 export default function SaveFileImporter({ onImport }: SaveFileImporterProps) {
@@ -18,8 +17,7 @@ export default function SaveFileImporter({ onImport }: SaveFileImporterProps) {
         const reader = new FileReader();
         reader.onload = (evt) => {
             try {
-                const { items, machines } = parseSaveFile(evt.target?.result as string);
-                onImport(items, machines);
+                onImport(parseSaveFile(evt.target?.result as string));
             } catch (err) {
                 console.error("Failed to parse save:", err);
                 setErrorMsg("Failed to parse save file. Please ensure it is a valid .es3 save string.");

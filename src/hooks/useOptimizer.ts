@@ -46,6 +46,8 @@ export function useOptimizer(
 
     const [kind, setKind] = useState<MachineKind | null>(savedState?.kind ?? null);
     const [label, setLabel] = useState<string>(savedState?.label ?? '');
+    // Which machine of the imported save this is, so the next save of the run hands it back its settings
+    const [saveId] = useState<number | undefined>(savedState?.saveId);
     const layout = layoutOf(kind, tier);
 
     const [targetStats, setTargetStats] = useState<TargetStats>(savedState?.targetStats ?? { Performance: null, Quality: null, Efficiency: null });
@@ -272,7 +274,7 @@ export function useOptimizer(
 
             const boardIds = boardToCalculate.map(row => row.map(c => c && c !== 'Locked' ? c.id : c));
             localStorage.setItem(`optimizer_machine_${machineId}`, JSON.stringify({
-                tier, kind, label, maximizeStats, targetStats, ignoreStats, statPriority, boardIds
+                tier, kind, label, saveId, maximizeStats, targetStats, ignoreStats, statPriority, boardIds
             }));
 
             if (inventory.length > 0) {
@@ -282,7 +284,7 @@ export function useOptimizer(
                 setSolutionCode('');
             }
         }
-    }, [inventory, tier, kind, label, layout, maximizeStats, targetStats, ignoreStats, statPriority, machineId, getUsedItems, board, isAnySolving]);
+    }, [inventory, tier, kind, label, saveId, layout, maximizeStats, targetStats, ignoreStats, statPriority, machineId, getUsedItems, board, isAnySolving]);
 
     return {
         tier, setTier, handleTierChange, targetStats, setTargetStats,

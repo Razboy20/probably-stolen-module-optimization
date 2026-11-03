@@ -7,7 +7,7 @@ import { useJointSolve, type MachineHandle } from './hooks/useJointSolve';
 import { isLockedModule } from './solver/locked';
 import { hasObjective, STAT_KEYS } from './solver/objective';
 import { type BoardCell, gridSizeOf } from './solver/board';
-import type { ImportedMachine } from './save/parseSave';
+import type { ImportedSave } from './save/parseSave';
 import MiniShape from './components/MiniShape';
 import SaveFileImporter from './components/SaveFileImporter';
 import BackendSelect from './components/BackendSelect';
@@ -1080,25 +1080,45 @@ export default function ModuleInventoryUI() {
         ));
     };
 
-    const handleImportSave = useCallback((newItems: InventoryItem[], newMachines: ImportedMachine[]) => {
-        setInventory(newItems);
+    // A later save of the same run keeps each machine's settings and each module's lock; the save decides everything else
+    const handleImportSave = useCallback(({ runId, items, machines: newMachines }: ImportedSave) => {
+        const sameRun = runId !== null && localStorage.getItem('optimizer_save_run') === runId;
+        if (runId !== null) localStorage.setItem('optimizer_save_run', runId);
+        else localStorage.removeItem('optimizer_save_run');
 
-        newMachines.forEach(({ id, boardIds, tier, kind, label }) => {
-            localStorage.setItem(`optimizer_machine_${id}`, JSON.stringify({ boardIds, tier, kind, label }));
+        const previousItems = new Map(inventory.map(item => [item.id, item]));
+        const infiniteNodes = inventory.some(item => item.color === 'White' && item.isInfinite);
+        setInventory(items.map(item => ({
+            ...item,
+            isLocked: sameRun ? previousItems.get(item.id)?.isLocked : undefined,
+            isInfinite: item.color === 'White' && infiniteNodes
+        })));
+
+        const previousBySaveId = new Map<number, string>();
+        if (sameRun) {
+            for (const { id } of machines) {
+                const saveId = readStoredJson<{ saveId?: number }>(`optimizer_machine_${id}`)?.saveId;
+                if (saveId !== undefined) previousBySaveId.set(saveId, id);
+            }
+        }
+
+        newMachines.forEach(({ id, saveId, boardIds, tier, kind, label }) => {
+            const previousId = previousBySaveId.get(saveId);
+            const settings = previousId ? readStoredJson<object>(`optimizer_machine_${previousId}`) : null;
+            localStorage.setItem(`optimizer_machine_${id}`, JSON.stringify({ ...settings, saveId, boardIds, tier, kind, label }));
+            if (previousId) localStorage.setItem(`optimizer_machine_locked_${id}`, localStorage.getItem(`optimizer_machine_locked_${previousId}`) ?? 'false');
         });
 
-        setMachines(prev => {
-            prev.forEach(m => {
-                localStorage.removeItem(`optimizer_machine_${m.id}`);
-                localStorage.removeItem(`optimizer_machine_locked_${m.id}`);
-            });
-            return newMachines.length > 0
-                ? newMachines.map(m => ({ id: m.id }))
-                : [{ id: newMachineId() }];
+        machines.forEach(({ id }) => {
+            localStorage.removeItem(`optimizer_machine_${id}`);
+            localStorage.removeItem(`optimizer_machine_locked_${id}`);
         });
+        setMachines(newMachines.length > 0
+            ? newMachines.map(m => ({ id: m.id }))
+            : [{ id: newMachineId() }]);
 
         machinesRef.current = {};
-    }, []);
+    }, [inventory, machines]);
 
     const shouldPushNodeToEnd = filterGroup !== 'All';
     const catalogDisplayList = shouldPushNodeToEnd
@@ -1163,7 +1183,7 @@ export default function ModuleInventoryUI() {
         const saved = readStoredJson<object>(`optimizer_machine_${machineId}`);
         if (!saved) return;
         const newId = newMachineId();
-        localStorage.setItem(`optimizer_machine_${newId}`, JSON.stringify({ ...saved, boardIds: undefined }));
+        localStorage.setItem(`optimizer_machine_${newId}`, JSON.stringify({ ...saved, boardIds: undefined, saveId: undefined }));
         setMachines(prev => [...prev, { id: newId }]);
     }, []);
 
