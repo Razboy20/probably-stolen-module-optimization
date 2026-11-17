@@ -20,13 +20,15 @@ const CODE = '}A^?Vk}dEPw1IITs{ccUx/H<cTJWa+cni{yt7U[=3CKQ/z)V42khI5?%*x3N*vRe9)
 const LOOM = 'Kotton Auto Loom Hydroponic Module';
 const STEP_LIMIT = 20_000_000;
 
-const mirrorCase = (stuckLoom = false) => {
+// takenOff removes that many pieces from the board, the first ones met reading it row by row, so their cells are empty
+const mirrorCase = (stuckLoom = false, takenOff = 0) => {
     const decoded = decodeSolution(CODE);
     if (stuckLoom) decoded.inventory.find(item => item.displayName === LOOM)!.isStuck = true;
+    const onBoard = [...new Set(decoded.board.flat().flatMap(cell => cell && cell !== 'Locked' ? [cell.id] : []))];
+    const gone = new Set(onBoard.slice(0, takenOff));
+    const initialBoard: Board = decoded.board.map(row => row.map(cell => cell && cell !== 'Locked' && gone.has(cell.id) ? null : cell));
     const machine: MachineConfig = { id: 'm', tier: 3, kind: 'Hydroponic System', targetStats: decoded.targetStats, maximizeStats: decoded.maximizeStats };
-    const request: SolveRequest = {
-        machines: [{ machine, initialBoard: decoded.board }], searchPoolInventory: decoded.inventory, fullInventory: decoded.inventory
-    };
+    const request: SolveRequest = { machines: [{ machine, initialBoard }], searchPoolInventory: decoded.inventory, fullInventory: decoded.inventory };
     return { request, setup: prepareSolve(request) };
 };
 
@@ -51,6 +53,21 @@ test('finds the mirrored layout, which no piece shares a cell with', () => {
     expect(search.exhausted()).toBe(true);
     expect(search.improvements()).toBe(1);
     expect(totalsOf(fromIndexBoard(search.best, setup.tables.items), request)).toEqual({ Performance: 155, Quality: 80, Efficiency: -426 });
+    expect(cellsPerItem(search.best)).toEqual(cellsPerItem(setup.initialSet));
+});
+
+// The counts are those of a plain search that tries every piece on every cell in turn, so nothing is lost to the dead ends that are skipped
+test('visits every layout of a full board', () => {
+    expect(arrangeFully(mirrorCase().setup).layouts()).toBe(12_560);
+});
+
+test('visits every layout of a board with empty cells', () => {
+    const { request, setup } = mirrorCase(false, 6);
+    const search = arrangeFully(setup);
+
+    expect(search.exhausted()).toBe(true);
+    expect(search.layouts()).toBe(193_984);
+    expect(totalsOf(fromIndexBoard(search.best, setup.tables.items), request)).toEqual({ Performance: -16, Quality: 30, Efficiency: -170 });
     expect(cellsPerItem(search.best)).toEqual(cellsPerItem(setup.initialSet));
 });
 

@@ -8,12 +8,13 @@ import { buildUpdate, type SolveUpdate } from './report';
 import { boardOfSet, prepareSolve, type SolveRequest, type SolveSetup } from './setup';
 import { createFramePacer, now } from './yielder';
 
-// How many placements the arrangement of one record may try, shared out evenly over its boards
-// A board of ten large pieces has ten thousand to a million layouts and is settled well inside this; one of many small pieces is not, and gets a few seconds
+// How many steps the arrangement of one record may take, shared out evenly over its boards
+// A full board of ten or so pieces has ten thousand to a few million layouts and is settled inside this;
+// one with several pieces of one outline, or with empty cells, can have a hundred times as many, and gets a few seconds
 export const ARRANGE_STEP_LIMIT = 20_000_000;
-// Placements tried between looks at the clock
+// Steps taken between looks at the clock
 const ARRANGE_SLICE_STEPS = 4096;
-// How long a stopped solve waits for the arranger, shared out evenly over the boards; most of what an arrangement gains turns up in its first two million placements
+// How long a stopped solve waits for the arranger, shared out evenly over the boards; most of what an arrangement gains turns up in its first fraction of a second
 export const ARRANGE_FINISH_MS = 300;
 
 /* Runs beside a solve and rearranges the pieces of the records the search reports, on any backend
