@@ -1,6 +1,6 @@
 import { type Arranger, runArranger } from './arranger';
 import type { ArrangeWorkerRequest, ArrangeWorkerResponse } from './arrangeWorker';
-import { runOptimizationEngine, type SolveRequest } from './engine';
+import { runOptimizationEngine, type SolveControl, type SolveRequest, type SolveUpdate } from './engine';
 import { GpuUnusableError, runGpuPopulation } from './gpu/population';
 import { clearGpuFailed, gpuMayWork, gpuSupported, markGpuFailed } from './gpu/probe';
 import type { SolverHandle, UpdateHandler } from './handle';
@@ -28,20 +28,25 @@ export const readBackendPreference = (): SolverBackend => {
 
 export const writeBackendPreference = (backend: SolverBackend) => localStorage.setItem(BACKEND_STORAGE_KEY, backend);
 
-// Passes on only the reports that beat every report before them, so several sources of records read as one improving record
-const recordGate = (onUpdate: UpdateHandler): UpdateHandler => {
+// Passes on only the reports that beat every report before them, so several sources of records read as one improving record, and says whether a report was one
+const recordGate = (onUpdate: UpdateHandler) => {
     let bestTiers: Int32Array | null = null;
-    return update => {
+    return (update: SolveUpdate) => {
         const tiers = Int32Array.from(update.tiers);
-        if (bestTiers !== null && compareTiers(tiers, bestTiers, tiers.length) <= 0) return;
+        if (bestTiers !== null && compareTiers(tiers, bestTiers, tiers.length) <= 0) return false;
         bestTiers = tiers;
         onUpdate(update);
+        return true;
     };
 };
 
 const runInline = (request: SolveRequest, onUpdate: UpdateHandler): SolverHandle => {
-    const control = { running: true };
-    return { stop: () => { control.running = false; }, done: runOptimizationEngine(request, control, onUpdate) };
+    const control: SolveControl = { running: true };
+    return {
+        stop: () => { control.running = false; },
+        adopt: update => { control.offered = update; },
+        done: runOptimizationEngine(request, control, onUpdate)
+    };
 };
 
 const spawnWorker = () => new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
@@ -75,12 +80,14 @@ const runInWorker = (request: SolveRequest, onUpdate: UpdateHandler): SolverHand
             stopped = true;
             send({ type: 'stop' });
         },
+        adopt: update => send({ type: 'adopt', update }),
         done
     };
 };
 
 /* Independent solves of the same request on several workers, each on its own random stream
  * Only a report that beats every report so far is passed on, so the caller sees one monotonically improving record
+ * A record from outside goes to one member only, so the others keep to the regions they are searching
  */
 const runPopulation = (request: SolveRequest, onUpdate: UpdateHandler, size: number): SolverHandle => {
     const seed = request.seed ?? randomSeed();
@@ -88,6 +95,7 @@ const runPopulation = (request: SolveRequest, onUpdate: UpdateHandler, size: num
     const members = Array.from({ length: size }, (_, thread) => runInWorker({ ...request, seed, thread }, gate));
     return {
         stop: () => members.forEach(m => m.stop()),
+        adopt: update => members[0].adopt(update),
         done: Promise.all(members.map(m => m.done)).then(results => ({ iterations: results.reduce((sum, r) => sum + r.iterations, 0) }))
     };
 };
@@ -102,7 +110,7 @@ const withFallback = (primary: SolverHandle, makeFallback: () => SolverHandle): 
         active = makeFallback();
         return active.done;
     });
-    return { stop: () => { stopped = true; active.stop(); }, done };
+    return { stop: () => { stopped = true; active.stop(); }, adopt: update => active.adopt(update), done };
 };
 
 const workersAvailable = () => typeof Worker !== 'undefined';
@@ -133,7 +141,7 @@ const runOnGpu = (request: SolveRequest, onUpdate: UpdateHandler, parallelism?: 
         .then(result => { clearGpuFailed(); return result; })
         .catch(error => { if (error instanceof GpuUnusableError) markGpuFailed(); throw error; })
         .finally(() => { gpuLeased = false; });
-    return withFallback({ stop: gpu.stop, done }, () => runOnCpu(request, gate));
+    return withFallback({ stop: gpu.stop, adopt: gpu.adopt, done }, () => runOnCpu(request, gate));
 };
 
 const runSearch = (
@@ -189,6 +197,7 @@ const startArranger = (request: SolveRequest, onUpdate: UpdateHandler, inWorker:
 };
 
 /* Every record the search reports is also handed to the arranger, and both report through one gate, so the caller sees whichever is ahead
+ * An arrangement that gets through the gate goes back to the search, which carries on from it and so hands the arranger its next record
  * A stopped solve is done once the arranger has finished with the last record
  * parallelism overrides the worker count or GPU thread count, for benchmarks
  */
@@ -197,7 +206,7 @@ export const runSolver = (
 ): SolverHandle => {
     const backend = resolveBackend(preference);
     const report = recordGate(onUpdate);
-    const arranger = startArranger(request, report, backend !== 'inline');
+    const arranger = startArranger(request, update => { if (report(update)) search.adopt(update); }, backend !== 'inline');
     const search = runSearch(request, update => { report(update); arranger.offer(update); }, backend, parallelism);
-    return { stop: search.stop, done: search.done.finally(() => arranger.finish()) };
+    return { stop: search.stop, adopt: search.adopt, done: search.done.finally(() => arranger.finish()) };
 };

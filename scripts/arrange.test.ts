@@ -5,6 +5,7 @@ import type { Board } from '../src/solver/board';
 import { calculateBoardStats } from '../src/solver/boardStats';
 import { runSolver } from '../src/solver/client';
 import { decodeSolution } from '../src/solver/codec';
+import { runOptimizationEngine } from '../src/solver/engine';
 import { BOARD_CELLS, MAX_PIECE_CELLS, ORIENT_CELL_COUNT, ORIENT_OFFSETS, ORIENT_TOTAL } from '../src/solver/geometry';
 import { fromIndexBoard, type IndexBoard } from '../src/solver/indexBoard';
 import type { MachineConfig } from '../src/solver/objective';
@@ -121,6 +122,24 @@ test('a live arranger reports a better arrangement of a record as soon as it has
     expect(updates[0].tiers).toEqual([800, -55]);
     await arranger.finish();
     expect(updates.length).toBe(1);
+});
+
+test('a search handed a record it cannot reach takes it as its own', async () => {
+    const mirror = mirrorCase();
+    const mirrored = buildUpdate(mirror.request, mirror.setup, arrangeFully(mirror.setup).best, Int32Array.of(800, -55, 0, 0));
+    // Every module off the board is out of the pool, as if the other machines held them, so the search has only this board's pieces to work with
+    const onBoard = new Set(mirror.request.machines[0].initialBoard.flat().flatMap(cell => cell && cell !== 'Locked' ? [cell.id] : []));
+    const searchPoolInventory = mirror.request.fullInventory.map(item => onBoard.has(item.id) ? item : { ...item, isLocked: true });
+    const reportsOf = async (offered: SolveUpdate | null) => {
+        const tiers: number[][] = [];
+        const request = { ...mirror.request, searchPoolInventory, seed: 1, maxIterations: 20_000 };
+        await runOptimizationEngine(request, { running: true, offered }, update => tiers.push(update.tiers));
+        return tiers;
+    };
+
+    // Left to itself the search reports the board it was given and never finds the mirror; holding the mirror, it has nothing better to report
+    expect(await reportsOf(null)).toEqual([[740, -56]]);
+    expect(await reportsOf(mirrored)).toEqual([]);
 });
 
 test('an arranger that is not live holds the last record until it is told to finish', async () => {

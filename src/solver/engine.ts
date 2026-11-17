@@ -5,7 +5,7 @@ import {
     BOARD_CELLS, cellMaskHi, cellMaskLo, MAX_PIECE_CELLS, ORIENT_CELL_COUNT, ORIENT_OFFSETS, PLACE_CELL_COUNT, PLACE_CELLS, PLACE_MASK_HI,
     PLACE_MASK_LO, PLACE_META, PLACE_VALID, placeEntry, SCAN_STRIDES, SHAPE_COUNT, shapeFitsFree
 } from './geometry';
-import { EMPTY } from './indexBoard';
+import { EMPTY, toIndexBoard } from './indexBoard';
 import { addMachineTiers, compareTiers, objectiveTiers, TIER_VECTOR_LENGTH } from './objective';
 import { MAX_PIECES_PER_BOARD } from './pool';
 import { buildUpdate, type SolveUpdate } from './report';
@@ -59,6 +59,8 @@ const copyTotals = (from: BoardTotals, to: BoardTotals) => {
 
 export interface SolveControl {
     running: boolean;
+    // A record found outside the search, the arranger's for one, which the search takes as its own if it is the better of the two
+    offered?: SolveUpdate | null;
 }
 
 export type { SolveRequest } from './setup';
@@ -470,10 +472,25 @@ export const runOptimizationEngine = async (
         onUpdate(buildUpdate(request, setup, bestSet, bestTiers));
     };
 
+    // An offered record that beats the search's own becomes the record, which is the board the next restart goes back to
+    // The climb in hand is left alone, since it may yet lead somewhere the offered board does not
+    const adoptOffered = () => {
+        const offered = control.offered;
+        if (!offered) return;
+        control.offered = null;
+        const offeredTiers = new Int32Array(TIER_VECTOR_LENGTH);
+        offeredTiers.set(offered.tiers);
+        if (hasRecord && compareTiers(offeredTiers, bestTiers, tierLength) <= 0) return;
+        bestTiers.set(offeredTiers);
+        offered.boards.forEach(({ board }, k) => boardOfSet(bestSet, k).set(toIndexBoard(board, tables.indexOf)));
+        hasRecord = true;
+    };
+
     const pacer = createFramePacer();
     let iterations = 0;
 
     try {
+        adoptOffered();
         while (control.running && iterations < maxIterations) {
             iterations++;
             const isStagnant = stagnationCounter >= stagnationLimit;
@@ -664,6 +681,7 @@ export const runOptimizationEngine = async (
             if (pacer.due()) {
                 flushUpdate();
                 await pacer.pause();
+                adoptOffered();
             }
         }
     } finally {

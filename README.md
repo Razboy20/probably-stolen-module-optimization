@@ -13,7 +13,7 @@ The search is an iterated local search over placements. It runs on one of four b
 - `workers`: a single Web Worker
 - `inline`: on the main thread
 
-Beside the search, an arranger takes each record and tries every way of laying its pieces back down, which finds layouts the search cannot step to, such as a board's mirror image. It runs in a worker of its own, or after the search on `inline`.
+Beside the search, an arranger takes each record and tries every way of laying its pieces back down, which finds layouts the search cannot step to, such as a board's mirror image. It runs in a worker of its own, or after the search on `inline`. A layout it finds goes back to the search, which carries on from it.
 
 ## Development
 

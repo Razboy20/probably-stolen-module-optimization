@@ -1,7 +1,8 @@
 import tgpu, { type TgpuRoot } from 'typegpu';
 import type { SolverHandle, UpdateHandler } from '../handle';
+import { toIndexBoard } from '../indexBoard';
 import { compareTiers, TIER_VECTOR_LENGTH } from '../objective';
-import { buildUpdate } from '../report';
+import { buildUpdate, type SolveUpdate } from '../report';
 import { randomSeed } from '../rng';
 import { prepareSolve, type SolveRequest } from '../setup';
 import { createSearchKernel, type SearchKernel } from './kernel';
@@ -66,6 +67,17 @@ const tiersBeat = (scores: number[], a: number, b: number, tierLength: number) =
     return false;
 };
 
+// A thread with no record, or failing that the one whose record every other beats
+const worstThread = (scores: number[], threads: number, tierLength: number) => {
+    let worst = 0;
+    for (let t = 0; t < threads; t++) {
+        const at = t * TIER_VECTOR_LENGTH;
+        if (scores[at] === NO_RECORD) return t;
+        if (tiersBeat(scores, worst * TIER_VECTOR_LENGTH, at, tierLength)) worst = t;
+    }
+    return worst;
+};
+
 // The record tiers a thread must be below to be in the worst MIGRATE_FRACTION-th of the threads that have a record
 const migrationThreshold = (scores: number[], threads: number, tierLength: number) => {
     const ranked: number[] = [];
@@ -88,6 +100,7 @@ const validated = async <T>(device: GPUDevice, work: () => Promise<T>) => {
  */
 export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler, threads = DEFAULT_THREADS): SolverHandle => {
     let running = true;
+    let offered: SolveUpdate | null = null;
     const maxIterations = request.maxIterations ?? Infinity;
 
     const solve = async () => {
@@ -117,6 +130,26 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
         };
 
         let bestTiers: Int32Array | null = null;
+
+        // An offered record that beats the leader's is written over the worst thread, as its record and the board it climbs from
+        // That thread is the champion from then on, so a migration right away hands the record to the worst quarter as well
+        const plantOffered = (scores: number[], leaderTiers: Int32Array) => {
+            const record = offered;
+            offered = null;
+            if (record === null) return -1;
+            const tiers = new Int32Array(TIER_VECTOR_LENGTH);
+            tiers.set(record.tiers);
+            if (compareTiers(tiers, leaderTiers, setup.tierLength) <= 0) return -1;
+            bestTiers = tiers;
+
+            const thread = worstThread(scores, threads, setup.tierLength);
+            const set = record.boards.flatMap(({ board }) => Array.from(toIndexBoard(board, setup.tables.indexOf)));
+            kernel.state.patch({
+                [thread]: { cur: set, best: set, bestTiers: Array.from(tiers), hasRecord: 1, hasEpoch: 0, stagnation: 0, stagnations: 0, curPieces: { 0: -1 } }
+            });
+            return thread;
+        };
+
         let iterations = 0;
         let dispatches = 0;
         let first = true;
@@ -133,28 +166,30 @@ export const runGpuPopulation = (request: SolveRequest, onUpdate: UpdateHandler,
             params.itersPerDispatch = tuneIters(params.itersPerDispatch, dt);
 
             const scores = await kernel.scores.read();
-            const winner = bestThread(scores, threads, setup.tierLength);
-            if (winner === -1) continue;
-            params.championIdx = winner;
+            const leader = bestThread(scores, threads, setup.tierLength);
+            if (leader === -1) continue;
+            const leaderTiers = Int32Array.from(scores.slice(leader * TIER_VECTOR_LENGTH, (leader + 1) * TIER_VECTOR_LENGTH));
+            const planted = plantOffered(scores, leaderTiers);
+            params.championIdx = planted === -1 ? leader : planted;
 
-            if (++dispatches % MIGRATE_EVERY === 0) {
+            if (planted !== -1 || ++dispatches % MIGRATE_EVERY === 0) {
                 const [b0, b1, b2, b3] = migrationThreshold(scores, threads, setup.tierLength);
                 Object.assign(params, { migrateBelow0: b0, migrateBelow1: b1, migrateBelow2: b2, migrateBelow3: b3 });
                 kernel.params.write(params);
                 migrate.dispatchWorkgroups(workgroups);
             }
+            if (planted !== -1) continue;
 
-            const tiers = Int32Array.from(scores.slice(winner * TIER_VECTOR_LENGTH, (winner + 1) * TIER_VECTOR_LENGTH));
-            if (bestTiers !== null && compareTiers(tiers, bestTiers, setup.tierLength) <= 0) continue;
-            bestTiers = tiers;
+            if (bestTiers !== null && compareTiers(leaderTiers, bestTiers, setup.tierLength) <= 0) continue;
+            bestTiers = leaderTiers;
 
             kernel.params.write(params);
             extract.dispatchWorkgroups(Math.ceil(kernel.setCells / WORKGROUP_SIZE));
             const board = Int32Array.from(await kernel.champion.read());
-            onUpdate(buildUpdate(request, setup, board, tiers));
+            onUpdate(buildUpdate(request, setup, board, leaderTiers));
         }
         return { iterations };
     };
 
-    return { stop: () => { running = false; }, done: solve() };
+    return { stop: () => { running = false; }, adopt: update => { offered = update; }, done: solve() };
 };
