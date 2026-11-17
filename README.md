@@ -13,6 +13,8 @@ The search is an iterated local search over placements. It runs on one of four b
 - `workers`: a single Web Worker
 - `inline`: on the main thread
 
+Beside the search, an arranger takes each record and tries every way of laying its pieces back down, which finds layouts the search cannot step to, such as a board's mirror image. It runs in a worker of its own, or after the search on `inline`.
+
 ## Development
 
 ```sh
@@ -31,6 +33,7 @@ pnpm bench                       # one machine, 3s, seed 1
 SEED=3 MS=10000 pnpm bench       # longer run on another case
 MACHINES=3 pnpm bench            # joint solve over three machines
 scripts/compare.sh <base> <cand> # A/B two checkouts over seeds 1-8
+bun test scripts/                # arranger tests
 ```
 
 `bench.ts` reads `SEED`, `N`, `MS`, `ITERS`, `TARGETS`, `IMPL`, `WORKERS`, `MACHINES`, `INDEPENDENT` and `PRESOLVE` from the environment. The search is stochastic, so judge changes on the compare table and never on a single run.

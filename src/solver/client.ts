@@ -1,3 +1,5 @@
+import { type Arranger, runArranger } from './arranger';
+import type { ArrangeWorkerRequest, ArrangeWorkerResponse } from './arrangeWorker';
 import { runOptimizationEngine, type SolveRequest } from './engine';
 import { GpuUnusableError, runGpuPopulation } from './gpu/population';
 import { clearGpuFailed, gpuMayWork, gpuSupported, markGpuFailed } from './gpu/probe';
@@ -134,11 +136,9 @@ const runOnGpu = (request: SolveRequest, onUpdate: UpdateHandler, parallelism?: 
     return withFallback({ stop: gpu.stop, done }, () => runOnCpu(request, gate));
 };
 
-// parallelism overrides the worker count or GPU thread count, for benchmarks
-export const runSolver = (
-    request: SolveRequest, onUpdate: UpdateHandler, preference = readBackendPreference(), parallelism?: number
+const runSearch = (
+    request: SolveRequest, onUpdate: UpdateHandler, backend: Exclude<SolverBackend, 'auto'>, parallelism?: number
 ): SolverHandle => {
-    const backend = resolveBackend(preference);
     if (backend === 'gpu') return runOnGpu(request, onUpdate, parallelism);
     if (backend !== 'inline') {
         try {
@@ -148,4 +148,56 @@ export const runSolver = (
         }
     }
     return runInline(request, onUpdate);
+};
+
+// A failed arranger costs the solve nothing but the rearranging, so it is never allowed to fail the solve
+const runArrangerInWorker = (request: SolveRequest, onUpdate: UpdateHandler): Arranger => {
+    const worker = new Worker(new URL('./arrangeWorker.ts', import.meta.url), { type: 'module' });
+    const send = (message: ArrangeWorkerRequest) => worker.postMessage(message);
+
+    const done = new Promise<void>(resolve => {
+        worker.onmessage = (event: MessageEvent<ArrangeWorkerResponse>) => {
+            const message = event.data;
+            if (message.type === 'update') {
+                onUpdate(message.update);
+            } else {
+                worker.terminate();
+                resolve();
+            }
+        };
+        worker.onerror = event => {
+            console.warn('Arranger failed, keeping what the search found', event.error ?? event.message);
+            worker.terminate();
+            resolve();
+        };
+    });
+    send({ type: 'start', request });
+
+    return { offer: update => send({ type: 'offer', update }), finish: () => { send({ type: 'finish' }); return done; } };
+};
+
+// Beside a search that runs off the main thread the arranger gets a worker of its own; an inline solve keeps to its one thread, and arranges once the search is over
+const startArranger = (request: SolveRequest, onUpdate: UpdateHandler, inWorker: boolean): Arranger => {
+    if (inWorker && workersAvailable()) {
+        try {
+            return runArrangerInWorker(request, onUpdate);
+        } catch (error) {
+            console.warn('Arranger worker unavailable, arranging on the main thread', error);
+        }
+    }
+    return runArranger(request, onUpdate, false);
+};
+
+/* Every record the search reports is also handed to the arranger, and both report through one gate, so the caller sees whichever is ahead
+ * A stopped solve is done once the arranger has finished with the last record
+ * parallelism overrides the worker count or GPU thread count, for benchmarks
+ */
+export const runSolver = (
+    request: SolveRequest, onUpdate: UpdateHandler, preference = readBackendPreference(), parallelism?: number
+): SolverHandle => {
+    const backend = resolveBackend(preference);
+    const report = recordGate(onUpdate);
+    const arranger = startArranger(request, report, backend !== 'inline');
+    const search = runSearch(request, update => { report(update); arranger.offer(update); }, backend, parallelism);
+    return { stop: search.stop, done: search.done.finally(() => arranger.finish()) };
 };

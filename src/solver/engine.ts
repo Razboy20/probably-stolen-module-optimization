@@ -12,7 +12,7 @@ import { buildUpdate, type SolveUpdate } from './report';
 import { randomSeed, type Rng, rngBelow, rngCoinFlip, seedRng } from './rng';
 import { boardOfSet, prepareSolve, type SolveRequest } from './setup';
 import { FLAG_FIXED, FLAG_STUCK } from './tables';
-import { createYielder, FRAME_BUDGET_MS, now, TIMER_YIELD_INTERVAL_MS } from './yielder';
+import { createFramePacer } from './yielder';
 
 // How many perturbations in a row the search rides out without a new record before it goes back to the record board
 export const RESTART_AFTER_STAGNATIONS = 8;
@@ -470,9 +470,7 @@ export const runOptimizationEngine = async (
         onUpdate(buildUpdate(request, setup, bestSet, bestTiers));
     };
 
-    const { portYield, timerYield, dispose } = createYielder();
-    let lastYield = now();
-    let lastTimerYield = lastYield;
+    const pacer = createFramePacer();
     let iterations = 0;
 
     try {
@@ -663,20 +661,14 @@ export const runOptimizationEngine = async (
                 }
             }
 
-            if (now() - lastYield >= FRAME_BUDGET_MS) {
+            if (pacer.due()) {
                 flushUpdate();
-                if (now() - lastTimerYield >= TIMER_YIELD_INTERVAL_MS) {
-                    await timerYield();
-                    lastTimerYield = now();
-                } else {
-                    await portYield();
-                }
-                lastYield = now();
+                await pacer.pause();
             }
         }
     } finally {
         flushUpdate();
-        dispose();
+        pacer.dispose();
     }
 
     return { iterations };

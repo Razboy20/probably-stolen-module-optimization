@@ -39,3 +39,24 @@ export const createYielder = () => {
 export const FRAME_BUDGET_MS = 12;
 // How often one of those yields must be a timer yield, so timer callbacks cannot starve.
 export const TIMER_YIELD_INTERVAL_MS = 32;
+
+// Tells a long-running loop when it has done a frame's worth of work, and hands control back for it
+export const createFramePacer = () => {
+    const { portYield, timerYield, dispose } = createYielder();
+    let lastYield = now();
+    let lastTimerYield = lastYield;
+
+    return {
+        due: () => now() - lastYield >= FRAME_BUDGET_MS,
+        pause: async () => {
+            if (now() - lastTimerYield >= TIMER_YIELD_INTERVAL_MS) {
+                await timerYield();
+                lastTimerYield = now();
+            } else {
+                await portYield();
+            }
+            lastYield = now();
+        },
+        dispose
+    };
+};
